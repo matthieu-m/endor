@@ -22,6 +22,9 @@ pub struct FxBuildHasher {
 
 impl FxBuildHasher {
     /// Creates a new instance with this specific seed.
+    ///
+    /// All `FxHasher` created by this instance will start with their state initialized with this seed.
+    #[inline(always)]
     pub fn new(seed: u64) -> Self {
         Self { seed }
     }

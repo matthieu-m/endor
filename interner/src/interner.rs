@@ -475,3 +475,78 @@ impl<H, A> fmt::Debug for InternerHeader<H, A> {
             .finish()
     }
 }
+
+#[doc(hidden)]
+pub mod compile_tests {
+
+    //  Bad enough it needs to be `pub`, there's really no sense in exposing it any further.
+    #![allow(dead_code)]
+
+    /// ```compile_fail,E0277
+    /// fn ensure_send<T: Send>() {}
+    ///
+    /// struct NoSendH(std::rc::Rc<u32>);
+    ///
+    /// ensure_send::<endor_interner::Interner<NoSendH>>();
+    /// ```
+    pub fn interner_not_send_if_hasher_not_send() {}
+
+    /// ```compile_fail,E0277
+    /// fn ensure_sync<T: Sync>() {}
+    ///
+    /// struct NoSyncH(std::cell::Cell<u32>);
+    ///
+    /// ensure_sync::<endor_interner::Interner<NoSyncH>>();
+    /// ```
+    pub fn interner_not_sync_if_hasher_not_sync() {}
+
+    /// ```compile_fail,E0277
+    /// #![feature(allocator_api)]
+    ///
+    /// fn ensure_send<T: Send>() {}
+    ///
+    /// struct NoSendA(std::rc::Rc<u32>);
+    ///
+    /// unsafe impl std::alloc::Allocator for NoSendA {
+    ///     fn allocate(&self, _: std::alloc::Layout) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> { todo!() }
+    ///     unsafe fn deallocate(&self, _: std::ptr::NonNull<u8>, _: std::alloc::Layout) { todo!() }
+    /// }
+    ///
+    /// ensure_send::<endor_interner::Interner<endor_interner::DefaultFxBuildHasher, NoSendA>>();
+    /// ```
+    pub fn interner_not_send_if_allocator_not_send() {}
+
+    /// ```compile_fail,E0277
+    /// #![feature(allocator_api)]
+    ///
+    /// fn ensure_sync<T: Sync>() {}
+    ///
+    /// struct NoSyncA(std::cell::Cell<u32>);
+    ///
+    /// unsafe impl std::alloc::Allocator for NoSyncA {
+    ///     fn allocate(&self, _: std::alloc::Layout) -> Result<std::ptr::NonNull<[u8]>, std::alloc::AllocError> { todo!() }
+    ///     unsafe fn deallocate(&self, _: std::ptr::NonNull<u8>, _: std::alloc::Layout) { todo!() }
+    /// }
+    ///
+    /// ensure_sync::<endor_interner::Interner<endor_interner::DefaultFxBuildHasher, NoSyncA>>();
+    /// ```
+    pub fn interner_not_sync_if_allocator_not_sync() {}
+} // mod compile_tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ensure_send<T: Send>() {}
+    fn ensure_sync<T: Sync>() {}
+
+    #[test]
+    fn interner_send() {
+        ensure_send::<Interner>();
+    }
+
+    #[test]
+    fn interner_sync() {
+        ensure_sync::<Interner>();
+    }
+} // mod tests

@@ -21,6 +21,10 @@ impl Id {
     /// Only 2^24 - 1 instances can be created by this method during the lifetime of the process, after which it fails
     /// unconditionally.
     pub fn new() -> Result<Self, InternerError> {
+        //  It's critically important that the Self::MAX_ID constant by within the expected bounds, so better
+        //  double-check, thank you Clippy.
+        #![allow(clippy::assertions_on_constants)]
+
         static ID_POOL: AtomicU32 = AtomicU32::new(0);
 
         debug_assert!(Self::MAX_ID > 0);
@@ -198,3 +202,49 @@ pub(crate) struct ShardIndex(pub u8);
 
 const INTERNER_BITS: u32 = 24;
 const SHARD_BITS: u32 = 8;
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashSet, thread};
+
+    use super::*;
+
+    #[test]
+    fn bytes_id() {
+        let offset = Offset(NonZeroU32::new(0x10_11_12_13).expect("non-zero"));
+        let interner = Id::new_unchecked(NonZeroU32::new(0x24_25_26).expect("non-zero"));
+        let shard = ShardIndex(0x37);
+
+        let id = BytesId::new(offset, interner, shard);
+
+        assert_eq!(0x24_25_26_37, id.shard_interner.get());
+
+        assert_eq!(offset, id.offset());
+        assert_eq!(interner, id.interner_id());
+        assert_eq!(shard, id.shard());
+    }
+
+    #[test]
+    fn unique_ids() {
+        const NB_SAMPLES: usize = 1024;
+        const NB_THREADS: usize = 8;
+
+        fn generate(n: usize) -> Result<Vec<Id>, InternerError> {
+            (0..n).map(|_| Id::new()).collect()
+        }
+
+        let handles: Vec<_> = (0..NB_THREADS)
+            .map(|_| {
+                thread::spawn(|| generate(NB_SAMPLES).expect("Sufficient number of IDs in pool"))
+            })
+            .collect();
+
+        let ids: HashSet<Id> = handles
+            .into_iter()
+            .map(|result| result.join().expect("Successfully ran to completion"))
+            .flat_map(|ids| ids)
+            .collect();
+
+        assert_eq!(NB_THREADS * NB_SAMPLES, ids.len());
+    }
+} // mod tests

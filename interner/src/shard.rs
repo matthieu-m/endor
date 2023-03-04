@@ -71,6 +71,7 @@ impl<A> ShardDirector<A> {
     /// #   Safety
     ///
     /// May only be called once on a given instance, unless the result is not dropped.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) unsafe fn into_allocator(&self) -> A {
         let allocator = &self.allocator;
 
@@ -981,3 +982,21 @@ impl Map {
 //  -   A map is safe to send across threads, and safe to access concurrently from multiple threads.
 unsafe impl Send for Map {}
 unsafe impl Sync for Map {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ensure_send<T: Send>() {}
+    fn ensure_sync<T: Sync>() {}
+
+    #[test]
+    fn shard_send() {
+        ensure_send::<Shard>();
+    }
+
+    #[test]
+    fn shard_sync() {
+        ensure_sync::<Shard>();
+    }
+} // mod tests
