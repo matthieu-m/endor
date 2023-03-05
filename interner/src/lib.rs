@@ -49,17 +49,17 @@
 //! -   A byte store, in which all strings are catenated. On top of its 8 bits shard ID, the `BytesId` contains a
 //!     32-bits offset within the byte store. The length is stored in the 4 bytes preceeding the memory pointed to by
 //!     the offset.
-//! -   A hashset, referencing slices of the byte store.
+//! -   A hashmap, referencing slices of the byte store.
 //!
-//! Both the byte store and hashset are "jagged", growing by adding more dynamically allocated arrays, and never
+//! Both the byte store and hashmap are "jagged", growing by adding more dynamically allocated arrays, and never
 //! freeing (nor ceasing to use) the existing arrays. This is the key to wait-freedom.
 //!
 //! Each array within the byte store contains its own "used" counter, and is used bump-allocator style. Inserting into
 //! the byte store is wait-free if there's enough memory, or if allocating is wait-free.
 //!
-//! The hashsets, instead, use a Swiss Map design, which is mostly wait-free, with the one exception being
-//! concurrently inserting two slices with a colliding hash, as the second must wait for the insertion of the first
-//! to check for equality.
+//! The hashmaps, instead, use a Swiss Map design, which is mostly wait-free, with the one exception being
+//! concurrently inserting two slices with a colliding hash residual within the same shard, as the second must wait for
+//! the insertion of the first to check for equality.
 
 //  Use only core and alloc, guaranteeing no I/O nor threads.
 #![cfg_attr(not(test), no_std)]

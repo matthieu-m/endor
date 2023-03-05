@@ -37,12 +37,7 @@ impl Id {
                 return Err(InternerError::IdPoolExhausted);
             }
 
-            let result = ID_POOL.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
+            let result = ID_POOL.compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed);
 
             if let Err(new_current) = result {
                 current = new_current;
@@ -113,10 +108,7 @@ impl BytesId {
         //  -   `interner.0 > 0` thus `shard.0 | interner.0 > 0`.
         let shard_interner = unsafe { NonZeroU32::new_unchecked(shard_interner) };
 
-        Self {
-            offset,
-            shard_interner,
-        }
+        Self { offset, shard_interner }
     }
 
     /// Returns the offset of the bytes' slice within the `Interner`.
@@ -234,15 +226,12 @@ mod tests {
         }
 
         let handles: Vec<_> = (0..NB_THREADS)
-            .map(|_| {
-                thread::spawn(|| generate(NB_SAMPLES).expect("Sufficient number of IDs in pool"))
-            })
+            .map(|_| thread::spawn(|| generate(NB_SAMPLES).expect("Sufficient number of IDs in pool")))
             .collect();
 
         let ids: HashSet<Id> = handles
             .into_iter()
-            .map(|result| result.join().expect("Successfully ran to completion"))
-            .flat_map(|ids| ids)
+            .flat_map(|result| result.join().expect("Successfully ran to completion"))
             .collect();
 
         assert_eq!(NB_THREADS * NB_SAMPLES, ids.len());

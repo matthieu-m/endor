@@ -2,7 +2,7 @@
 use core::{error, fmt};
 
 /// Errors returned by this library.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum InternerError {
     /// The `BytesId` or `StringId` is not from this instance of `Interner`.
     IdMismatch,

@@ -2,8 +2,7 @@
 
 use core::{
     alloc::Layout,
-    cmp, fmt, hint,
-    mem::{self, ManuallyDrop},
+    cmp, fmt, hint, mem,
     num::NonZeroU32,
     ptr::{self, NonNull},
     sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering},
@@ -21,19 +20,12 @@ pub(crate) struct ShardDirector<A> {
     log_number_shards: u8,
     log_initial_bytes: u8,
     log_initial_groups: u8,
-    allocator: ManuallyDrop<A>,
+    allocator: A,
 }
 
 impl<A> ShardDirector<A> {
     /// Creates a new director.
-    pub(crate) fn new(
-        log_number_shards: u8,
-        log_initial_bytes: u8,
-        log_initial_groups: u8,
-        allocator: A,
-    ) -> Self {
-        let allocator = ManuallyDrop::new(allocator);
-
+    pub(crate) fn new(log_number_shards: u8, log_initial_bytes: u8, log_initial_groups: u8, allocator: A) -> Self {
         Self {
             log_number_shards,
             log_initial_bytes,
@@ -65,23 +57,6 @@ impl<A> ShardDirector<A> {
     pub(crate) fn allocator(&self) -> &A {
         &self.allocator
     }
-
-    /// Returns the allocator itself.
-    ///
-    /// #   Safety
-    ///
-    /// May only be called once on a given instance, unless the result is not dropped.
-    #[allow(clippy::wrong_self_convention)]
-    pub(crate) unsafe fn into_allocator(&self) -> A {
-        let allocator = &self.allocator;
-
-        //  Safety
-        //  -   Will not be called again if the result is dropped.
-        //  -   Will not be dropped.
-        let allocator: ManuallyDrop<A> = unsafe { ptr::read(allocator as *const _) };
-
-        ManuallyDrop::into_inner(allocator)
-    }
 }
 
 impl<A> fmt::Debug for ShardDirector<A> {
@@ -106,7 +81,7 @@ impl Shard {
     /// #   Safety
     ///
     /// This `director` must have been used for all insertions in this instance.
-    pub(crate) unsafe fn reset<A>(&self, director: &ShardDirector<A>)
+    pub(crate) unsafe fn reset<A>(&mut self, director: &ShardDirector<A>)
     where
         A: Allocator,
     {
@@ -131,11 +106,7 @@ impl Shard {
     /// #   Complexity
     ///
     /// O(1) in time and space.
-    pub(crate) unsafe fn get_unchecked<'a, A>(
-        &'a self,
-        offset: Offset,
-        director: &ShardDirector<A>,
-    ) -> &'a [u8] {
+    pub(crate) unsafe fn get_unchecked<'a, A>(&'a self, offset: Offset, director: &ShardDirector<A>) -> &'a [u8] {
         //  Safety:
         //  -   `id` was obtained from this instance.
         //  -   This instance has not been reset since `id` was obtained.
@@ -193,10 +164,7 @@ impl Shard {
             //  -   `offset` was obtained from this instance.
             //  -   This instance has not been reset since `offset` was obtained.
             //  -   This `director` has been used for all previous insertions in this instance.
-            let (slice, store) = unsafe {
-                self.store
-                    .get_slice_unchecked_with_metadata(offset, director)
-            };
+            let (slice, store) = unsafe { self.store.get_slice_unchecked_with_metadata(offset, director) };
 
             (slice, store, map)
         })
@@ -251,6 +219,15 @@ impl<A> ShardDirector<A> {
         }
     }
 
+    //  Returns the number of bytes _prior_ to the part at the given index.
+    fn previous_bytes_of(&self, index: PartIndex) -> usize {
+        if index.0 > 0 {
+            self.bytes_of(index)
+        } else {
+            0
+        }
+    }
+
     //  Returns the index of the part, and within the part, of the given offset.
     fn bytes_part_of(&self, offset: Offset) -> (PartIndex, ByteIndex) {
         let offset = offset.0.get() as usize;
@@ -261,12 +238,12 @@ impl<A> ShardDirector<A> {
             mem::size_of::<usize>() * 8 - outer.leading_zeros() as usize
         };
 
-        debug_assert!(self.bytes_of(PartIndex(outer)) >= offset);
+        debug_assert!(self.previous_bytes_of(PartIndex(outer)) <= offset);
         debug_assert!(offset < self.bytes_of(PartIndex(outer + 1)));
 
         (
             PartIndex(outer),
-            ByteIndex(offset - self.bytes_of(PartIndex(outer))),
+            ByteIndex(offset - self.previous_bytes_of(PartIndex(outer))),
         )
     }
 
@@ -279,9 +256,9 @@ impl<A> ShardDirector<A> {
     }
 
     fn layout_bytes(&self, index: PartIndex) -> Option<Layout> {
-        let number_bytes = self.bytes_of(index) + mem::size_of::<PartLength>();
+        let number_bytes = self.bytes_of(index);
 
-        Layout::from_size_align(number_bytes, mem::align_of::<PartLength>()).ok()
+        Layout::from_size_align(number_bytes, 1).ok()
     }
 
     fn layout_groups(&self, index: PartIndex) -> Option<Layout> {
@@ -342,7 +319,18 @@ where
     }
 }
 
-struct Store([AtomicPtr<u8>; JAGGED_LENGTH]);
+#[derive(Default)]
+struct Store {
+    //  It is tempting to prepend the length in the memory allocation pointed to by part, however this is undesirable
+    //  for two reasons:
+    //
+    //  1.  Memory indirection - it makes it impossible to read the length without having first dereferenced `parts[i]`.
+    //  2.  Allocation size - memory allocators are friands of power-of-2 sized allocations, adding a measly 8 bytes on
+    //      top requires the allocator to use the next allocation size, wasting quite a bit. While not a problem
+    //      cache-wise, it may still be a problem for custom allocators with limited available memory.
+    lengths: [PartLength; JAGGED_LENGTH],
+    parts: [AtomicPtr<u8>; JAGGED_LENGTH],
+}
 
 impl Store {
     //  Resets the store, invalidating all allocated `Offset`.
@@ -350,12 +338,15 @@ impl Store {
     //  #   Safety
     //
     //  This `director` must have been used for all previous insertions in this instance.
-    unsafe fn reset<A>(&self, director: &ShardDirector<A>)
+    unsafe fn reset<A>(&mut self, director: &ShardDirector<A>)
     where
         A: Allocator,
     {
-        for (index, pointer) in self.0.iter().enumerate() {
+        for (index, (length, pointer)) in self.lengths.iter().zip(self.parts.iter()).enumerate() {
+            length.store(0, Ordering::Relaxed);
+
             let pointer = pointer.swap(ptr::null_mut(), Ordering::Relaxed);
+
             let Some(pointer) = NonNull::new(pointer) else { continue };
 
             //  Safety:
@@ -376,11 +367,7 @@ impl Store {
     //  #   Complexity
     //
     //  O(1) in time and space.
-    unsafe fn get_slice_unchecked<'a, A>(
-        &'a self,
-        offset: Offset,
-        director: &ShardDirector<A>,
-    ) -> &'a [u8] {
+    unsafe fn get_slice_unchecked<'a, A>(&'a self, offset: Offset, director: &ShardDirector<A>) -> &'a [u8] {
         //  Safety:
         //  -   `offset` was obtained from this instance.
         //  -   This instance has not been reset since `offset` was obtained.
@@ -413,29 +400,22 @@ impl Store {
             offset: inner.0,
         };
 
-        let length = director.bytes_of(part) + mem::size_of::<PartLength>();
+        debug_assert!(part.0 < self.parts.len());
 
         //  Safety:
         //  -   `part` is within bounds, since `offset` exists.
-        let pointer = unsafe { self.0.get_unchecked(part.0) };
+        let pointer = unsafe { self.parts.get_unchecked(part.0) };
 
         let pointer = pointer.load(Ordering::Relaxed);
 
-        //  Safety:
-        //  -   `pointer` is non-null since `offset` points into it.
-        let pointer = unsafe { NonNull::new_unchecked(pointer) };
-
-        let part = NonNull::slice_from_raw_parts(pointer, length);
-
-        //  Safety:
-        //  -   `part` is larger than `PartLength`.
-        let (_, slice) = unsafe { Self::get_part_unchecked(part) };
-
-        let pointer = slice.as_non_null_ptr().as_ptr() as *const u8;
+        debug_assert!(inner.0 < director.bytes_of(part));
+        debug_assert!((inner.0 as u64) < self.lengths[part.0].load(Ordering::Relaxed));
 
         //  Safety:
         //  -   `inner` is guaranteed to be within the allocation.
         let pointer = unsafe { pointer.add(inner.0) };
+
+        debug_assert!(inner.0 >= mem::size_of::<SliceLength>());
 
         //  Safety:
         //  -   The length is recorded prior to any bytes.
@@ -467,17 +447,13 @@ impl Store {
     //
     //  -   O(slice.len()) due to copying the slice.
     //  -   O(self.0.len()) due to attempting to fit the slice in all parts in the worse case.
-    unsafe fn push_slice<A>(
-        &self,
-        slice: &[u8],
-        director: &ShardDirector<A>,
-    ) -> Result<Offset, InternerError>
+    unsafe fn push_slice<A>(&self, slice: &[u8], director: &ShardDirector<A>) -> Result<Offset, InternerError>
     where
         A: Allocator,
     {
         debug_assert!(slice.len() <= SliceLength::MAX as usize);
 
-        for (part, pointer) in self.0.iter().enumerate() {
+        for (part, (part_length, pointer)) in self.lengths.iter().zip(self.parts.iter()).enumerate() {
             let part = PartIndex(part);
 
             let bytes = pointer.load(Ordering::Relaxed);
@@ -485,16 +461,25 @@ impl Store {
             let bytes = if let Some(bytes) = NonNull::new(bytes) {
                 bytes
             } else {
-                self.try_allocate(part, director)?
+                Self::try_allocate(part, pointer, director)?
             };
 
-            let length = director.bytes_of(part) + mem::size_of::<PartLength>();
+            let previous_offset = if part.0 > 0 {
+                director
+                    .previous_bytes_of(part)
+                    .try_into()
+                    .map_err(|_| InternerError::ByteStorageExhausted)?
+            } else {
+                0
+            };
+
+            let length = director.bytes_of(part);
 
             let part = NonNull::slice_from_raw_parts(bytes, length);
 
             //  Safety:
-            //  -   `part` is larger than `PartLength`.
-            let offset = unsafe { Self::push_slice_in_part(part, slice) };
+            //  -   `part_length` matches `part`.
+            let offset = unsafe { Self::push_slice_in_part(previous_offset, part_length, part, slice) };
 
             match offset {
                 Err(InternerError::ByteStorageExhausted) => continue,
@@ -509,37 +494,30 @@ impl Store {
     //
     //  #   Safety
     //
-    //  - `part` must be larger than `PartLength`.
-    //  -   This `director` must have been used for all previous insertions in this instance.
+    //  - `part_length` must match `part`.
     unsafe fn push_slice_in_part(
+        previous_offset: u32,
+        part_length: &PartLength,
         part: NonNull<[u8]>,
         slice: &[u8],
     ) -> Result<Offset, InternerError> {
-        //  Safety:
-        //  -   `part` is larger than `PartLength`.
-        let (length_part, pointer_part) = unsafe { Self::get_part_unchecked(part) };
-
         let length = slice.len() as u64;
-        let number_bytes = pointer_part.len() as u64;
+        let number_bytes = part.len() as u64;
 
         //  Quick check to avoid incrementing pointlessly:
         //
         //  -   It's good safety wise, to avoid overflow.
         //  -   It's good performance wise, as pure reads are cheaper than RMV.
-        if length_part.load(Ordering::Relaxed) + length + SLICE_LENGTH_BYTES > number_bytes {
+        if part_length.load(Ordering::Relaxed) + length + SLICE_LENGTH_BYTES > number_bytes {
             return Err(InternerError::ByteStorageExhausted);
         }
 
         //  Of course, with concurrency, there may still be other threads adding before we do.
-        let previous_length_part =
-            length_part.fetch_add(length + SLICE_LENGTH_BYTES, Ordering::Relaxed);
+        let previous_part_length = part_length.fetch_add(length + SLICE_LENGTH_BYTES, Ordering::Relaxed);
 
         //  If the offset cannot be encoded, no point going any further...
         let offset = || -> Option<NonZeroU32> {
-            let previous_offset: u32 = number_bytes.try_into().ok()?;
-            let inner_offset: u32 = (previous_length_part + SLICE_LENGTH_BYTES)
-                .try_into()
-                .ok()?;
+            let inner_offset: u32 = (previous_part_length + SLICE_LENGTH_BYTES).try_into().ok()?;
 
             let offset = previous_offset.checked_add(inner_offset)?;
 
@@ -549,25 +527,19 @@ impl Store {
         let Some(offset) = offset() else { return Err(InternerError::ByteStorageExhausted) };
 
         //  Got beaten to the punch, bail out and let the outer loop move on to the next part.
-        if previous_length_part + length + SLICE_LENGTH_BYTES > number_bytes {
+        if previous_part_length + length + SLICE_LENGTH_BYTES > number_bytes {
             return Err(InternerError::ByteStorageExhausted);
         }
 
-        //  Exclusive access to `previous_length_part..(+length+SLICE_LENGTH_BYTES)` has been secured!
+        //  Exclusive access to `previous_part_length..(+length+SLICE_LENGTH_BYTES)` has been secured!
 
         //  Safety:
         //  -   Within bounds of the allocation, thus will not overflow.
-        let length_pointer =
-            unsafe { pointer_part.as_mut_ptr().add(previous_length_part as usize) };
+        let length_pointer = unsafe { part.as_mut_ptr().add(previous_part_length as usize) };
 
         //  Safety:
         //  -   `length_pointer` is valid for writes.
-        unsafe {
-            ptr::write_unaligned(
-                length_pointer as *mut SliceLength,
-                slice.len() as SliceLength,
-            )
-        };
+        unsafe { ptr::write_unaligned(length_pointer as *mut SliceLength, slice.len() as SliceLength) };
 
         //  Safety:
         //  -   Within bounds of the allocation, thus will not overflow.
@@ -585,47 +557,12 @@ impl Store {
         Ok(Offset(offset))
     }
 
-    //  Returns the matching atomic & raw slice of bytes.
-    //
-    //  #   Safety
-    //
-    //  -   `part` must be larger than `PartLength`.
-    //  -   This `director` must have been used for all previous insertions in this instance.
-    unsafe fn get_part_unchecked<'a>(part: NonNull<[u8]>) -> (&'a PartLength, NonNull<[u8]>) {
-        debug_assert!(part.len() >= mem::size_of::<PartLength>());
-
-        let number_bytes = part.len() - mem::size_of::<PartLength>();
-
-        let pointer = part.as_non_null_ptr();
-
-        let atomic_pointer = part.cast();
-
-        //  Safety:
-        //  -   `atomic_pointer` is properly aligned.
-        //  -   `atomic_pointer` is dereferenceable.
-        //  -   `atomic_pointer` points to an initialized (zeroed) instance.
-        //  -   There is no accessible mutable reference to this memory area.
-        let atomic = unsafe { atomic_pointer.as_ref() };
-
-        //  Safety:
-        //  -   The allocation was sized with a leading PartLength.
-        let bytes = unsafe { pointer.as_ptr().add(mem::size_of::<PartLength>()) };
-
-        //  Safety:
-        //  -   `bytes` is non-null, as otherwise this means `add` overflowed, which is already UB.
-        let bytes = unsafe { NonNull::new_unchecked(bytes) };
-
-        let slice = NonNull::slice_from_raw_parts(bytes, number_bytes);
-
-        (atomic, slice)
-    }
-
     //  Tries to allocate a new part at `index`.
     //
     //  Failure means that another thread allocated, so that when `try_allocate` returns, the part at `index` is ready.
     fn try_allocate<A>(
-        &self,
         part: PartIndex,
+        pointer: &AtomicPtr<u8>,
         director: &ShardDirector<A>,
     ) -> Result<NonNull<u8>, InternerError>
     where
@@ -635,12 +572,7 @@ impl Store {
 
         let current = ptr::null_mut();
 
-        if let Err(p) = self.0[part.0].compare_exchange(
-            current,
-            bytes.as_ptr(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        if let Err(p) = pointer.compare_exchange(current, bytes.as_ptr(), Ordering::Relaxed, Ordering::Relaxed) {
             //  Safety:
             //  -   Freshly allocated.
             unsafe { director.deallocate_bytes(bytes, part) };
@@ -717,36 +649,33 @@ impl Map {
             //  -   `number_groups` is the number of groups pointed to by the part pointer.
             let groups = unsafe { core::slice::from_raw_parts(part, number_groups) };
 
-            groups
-                .iter()
-                .enumerate()
-                .flat_map(move |(group_index, group)| {
-                    group
-                        .header
-                        .iter()
-                        .zip(group.elements.iter())
-                        .enumerate()
-                        .filter_map(move |(index, (h, e))| {
-                            let residual = h.load(Ordering::Acquire);
-                            let metadata = MapMetadata {
-                                part: part_index.0,
-                                group: group_index,
-                                index,
-                            };
+            groups.iter().enumerate().flat_map(move |(group_index, group)| {
+                group
+                    .header
+                    .iter()
+                    .zip(group.elements.iter())
+                    .enumerate()
+                    .filter_map(move |(index, (h, e))| {
+                        let residual = h.load(Ordering::Acquire);
+                        let metadata = MapMetadata {
+                            part: part_index.0,
+                            group: group_index,
+                            index,
+                        };
 
-                            if residual > 0 && residual < 0x80 {
-                                let offset = e.load(Ordering::Relaxed);
+                        if residual > 0 && residual < 0x80 {
+                            let offset = e.load(Ordering::Relaxed);
 
-                                //  Safety:
-                                //  -   `offset` is non-zero, as only non-zero are stored.
-                                let offset = unsafe { NonZeroU32::new_unchecked(offset) };
+                            //  Safety:
+                            //  -   `offset` is non-zero, as only non-zero are stored.
+                            let offset = unsafe { NonZeroU32::new_unchecked(offset) };
 
-                                Some((Offset(offset), metadata))
-                            } else {
-                                None
-                            }
-                        })
-                })
+                            Some((Offset(offset), metadata))
+                        } else {
+                            None
+                        }
+                    })
+            })
         })
     }
 
@@ -947,11 +876,7 @@ impl Map {
     }
 
     //  Tries to allocate memory, returns an error if allocation failed.
-    fn try_allocate<A>(
-        &self,
-        part: PartIndex,
-        director: &ShardDirector<A>,
-    ) -> Result<NonNull<MapGroup>, InternerError>
+    fn try_allocate<A>(&self, part: PartIndex, director: &ShardDirector<A>) -> Result<NonNull<MapGroup>, InternerError>
     where
         A: Allocator,
     {
@@ -959,12 +884,8 @@ impl Map {
 
         let current = ptr::null_mut();
 
-        if let Err(p) = self.0[part.0].compare_exchange(
-            current,
-            groups.as_ptr(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        if let Err(p) = self.0[part.0].compare_exchange(current, groups.as_ptr(), Ordering::Relaxed, Ordering::Relaxed)
+        {
             //  Safety:
             //  -   Freshly allocated.
             unsafe { director.deallocate_groups(groups, part) };
@@ -985,6 +906,8 @@ unsafe impl Sync for Map {}
 
 #[cfg(test)]
 mod tests {
+    use alloc::alloc::Global;
+
     use super::*;
 
     fn ensure_send<T: Send>() {}
@@ -998,5 +921,157 @@ mod tests {
     #[test]
     fn shard_sync() {
         ensure_sync::<Shard>();
+    }
+
+    #[test]
+    fn store_append_small() {
+        //  Checks that a small allocation fits into the first part.
+
+        const SLICE: &[u8] = b"Allo";
+
+        let store = TestStore::new(8);
+
+        let offset = store.push_slice(SLICE).expect("Success");
+
+        assert_eq!(4, offset.0.get());
+
+        //  Safety:
+        //  -   `offset` was obtained from `store`.
+        //  -   `store.store` was not reset since `offset` was obtained.
+        let actual = unsafe { store.get_slice(offset) };
+
+        assert_eq!(SLICE, actual);
+    }
+
+    #[test]
+    fn store_append_too_big_for_first() {
+        //  Checks that a larger allocation may require offloading to a larger part.
+
+        const SLICE: &[u8] = b"Hello";
+
+        let store = TestStore::new(8);
+
+        let offset = store.push_slice(SLICE).expect("Success");
+
+        assert_eq!(20, offset.0.get());
+
+        //  Safety:
+        //  -   `offset` was obtained from `store`.
+        //  -   `store.store` was not reset since `offset` was obtained.
+        let actual = unsafe { store.get_slice(offset) };
+
+        assert_eq!(SLICE, actual);
+    }
+
+    #[test]
+    fn store_append_multi() {
+        //  Checks that multiple slices can be inserted and retrieved.
+
+        const SLICES: &[&[u8]] = &[
+            b"Hello, World",
+            b"Pfft",
+            b"Arsene Lupin, gentleman cambrioleur",
+            b"i",
+            b"foo",
+        ];
+
+        let store = TestStore::new(8);
+
+        let offsets: Vec<_> = SLICES
+            .iter()
+            .map(|slice| store.push_slice(slice).expect("Success"))
+            .collect();
+
+        assert_eq!(20, offsets[0].0.get()); //  3rd part, offset by slice length.
+        assert_eq!(4, offsets[1].0.get()); //  1st part, offset by slice length.
+        assert_eq!(68, offsets[2].0.get()); //  5th part, offset by slice length.
+        assert_eq!(12, offsets[3].0.get()); //  2nd part, offset by slice length.
+        assert_eq!(36, offsets[4].0.get()); //  4th part, offset by slice length.
+
+        for (expected, offset) in SLICES.iter().zip(offsets.into_iter()) {
+            //  Safety:
+            //  -   `offset` was obtained from `store`.
+            //  -   `store.store` was not reset since `offset` was obtained.
+            let actual = unsafe { store.get_slice(offset) };
+
+            assert_eq!(*expected, actual);
+        }
+    }
+
+    #[test]
+    fn store_append_too_big_for_any() {
+        //  Checks that a very large allocation may not be suitable at all.
+
+        let store = TestStore::new(8);
+
+        let maximum_part_capacity =
+            store.director.bytes_of(PartIndex(JAGGED_LENGTH - 1)) - mem::size_of::<SliceLength>();
+
+        let too_big = vec![0xef; maximum_part_capacity + 1];
+
+        let result = store.push_slice(&too_big);
+
+        assert_eq!(Err(InternerError::ByteStorageExhausted), result);
+    }
+
+    struct TestStore<A = Global>
+    where
+        A: Allocator,
+    {
+        director: ShardDirector<A>,
+        store: Store,
+    }
+
+    impl TestStore<Global> {
+        fn new(number_bytes: usize) -> Self {
+            let log_number_shards = 4;
+            let log_initial_bytes = number_bytes.ilog2() as u8;
+            let log_initial_groups = 3;
+            let allocator = Global::default();
+
+            let director = ShardDirector::new(log_number_shards, log_initial_bytes, log_initial_groups, allocator);
+            let store = Store::default();
+
+            Self { director, store }
+        }
+    }
+
+    impl<A> TestStore<A>
+    where
+        A: Allocator,
+    {
+        //  TODO: with_allocator.
+
+        //  Gets the slice associated to the offset.
+        //
+        //  #   Safety
+        //
+        //  -   `offset` must have been returned to this instance.
+        //  -   The underlying `store` must not have been reset since `offset` was returned.
+        unsafe fn get_slice(&self, offset: Offset) -> &[u8] {
+            //  Safety:
+            //  -   `offset` has been returned from `self.store`.
+            //  -   `self.store` has not been reset since `offset` was returned.
+            //  -   This `director` has been used for all previous allocations.
+            unsafe { self.store.get_slice_unchecked(offset, &self.director) }
+        }
+
+        //  Pushes a slice, returning its offset, or an error if returning it was not possible.
+        fn push_slice(&self, slice: &[u8]) -> Result<Offset, InternerError> {
+            //  Safety:
+            //  -   This `director` has been used for all previous allocations.
+            unsafe { self.store.push_slice(slice, &self.director) }
+        }
+    }
+
+    impl<A> Drop for TestStore<A>
+    where
+        A: Allocator,
+    {
+        fn drop(&mut self) {
+            //  Safety:
+            //  -   This `director` has been used for all allocations.
+            unsafe { self.store.reset(&self.director) };
+        }
     }
 } // mod tests

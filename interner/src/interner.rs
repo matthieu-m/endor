@@ -3,7 +3,7 @@
 use core::{
     fmt,
     hash::{BuildHasher, Hasher},
-    mem,
+    mem::{self, ManuallyDrop},
     ptr::{self, NonNull},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -170,35 +170,28 @@ where
 
         let previous = header.ref_count.fetch_sub(1, Ordering::Relaxed);
 
-        if previous > 1 {
+        if previous > 0 {
             return;
         }
 
-        let number_shards = header.director.number_shards();
+        let director = unsafe { ptr::read(&header.director) };
+        let director = ManuallyDrop::into_inner(director);
 
-        for shard in 0..number_shards {
-            let shard = ShardIndex(shard as u8);
-
-            //  Safety:
-            //  -   `shard` is within bounds.
-            let shard = unsafe { self.get_shard(shard) };
-
+        for shard in self.get_shards_mut() {
             //  Safety:
             //  -   The same director was used for all operations.
-            unsafe { shard.reset(&header.director) }
+            unsafe { shard.reset(&director) }
         }
 
-        let layout = Self::layout(number_shards.ilog2() as u8);
+        let number_shards = director.number_shards();
 
-        //  Safety:
-        //  -   No further call to `into_allocator` will occur.
-        let allocator = unsafe { header.director.into_allocator() };
+        let layout = Self::layout(number_shards.ilog2() as u8);
 
         //  Safety:
         //  -   `self.0` will no longer be used: this was the last reference, and this is the last line.
         //  -   `self.0` was allocated by this allocator.
         //  -   `layout` was calculated the same way as for the allocation of `self.0`.
-        unsafe { allocator.deallocate(self.0.cast(), layout) }
+        unsafe { director.allocator().deallocate(self.0.cast(), layout) }
     }
 }
 
@@ -339,11 +332,7 @@ where
     /// -   No ID was specified, and the pool of IDs is exhausted,
     //  -   or because the allocator cannot currently allocate enough memory for the Interner itself.
     pub fn build(self) -> Result<Interner<H, A>, InternerError> {
-        let id = if let Some(id) = self.id {
-            id
-        } else {
-            Id::new()?
-        };
+        let id = if let Some(id) = self.id { id } else { Id::new()? };
 
         let hasher = self.hasher;
 
@@ -367,7 +356,7 @@ struct InternerHeader<H, A> {
     ref_count: AtomicU64, //  Number of owners - 1.
     id: Id,
     hasher: H,
-    director: ShardDirector<A>,
+    director: ManuallyDrop<ShardDirector<A>>,
 }
 
 impl<H, A> Interner<H, A>
@@ -378,8 +367,7 @@ where
         let number_shards = 1usize << log_number_shards;
 
         let header_layout = Layout::new::<InternerHeader<H, A>>();
-        let shards_layout =
-            Layout::array::<Shard>(number_shards).expect("Sufficiently low number of shards");
+        let shards_layout = Layout::array::<Shard>(number_shards).expect("Sufficiently low number of shards");
 
         let (layout, offset) = header_layout
             .extend(shards_layout)
@@ -452,11 +440,31 @@ where
         //  -   `pointer` points to `number_shards` initialized shards.
         unsafe { core::slice::from_raw_parts(pointer as *const u8 as *const Shard, number_shards) }
     }
+
+    //  Returns a reference to the slice of shards.
+    fn get_shards_mut(&mut self) -> &mut [Shard] {
+        let header = self.get_header();
+
+        let offset = mem::size_of::<InternerHeader<H, A>>();
+        let number_shards = header.director.number_shards();
+
+        let pointer: *mut u8 = self.0.cast().as_ptr();
+
+        //  Safety:
+        //  -   `offset` is within bounds, even with 0 shards.
+        //  -   `isize::MAX` is not overflowed since the allocation succeeded for the number of shards.
+        let pointer = unsafe { pointer.add(offset) };
+
+        //  Safety:
+        //  -   `pointer` points to `number_shards` initialized shards.
+        unsafe { core::slice::from_raw_parts_mut(pointer as *mut Shard, number_shards) }
+    }
 }
 
 impl<H, A> InternerHeader<H, A> {
     fn new(id: Id, hasher: H, director: ShardDirector<A>) -> Self {
         let ref_count = AtomicU64::new(0);
+        let director = ManuallyDrop::new(director);
 
         Self {
             ref_count,
