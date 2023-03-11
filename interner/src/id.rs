@@ -197,8 +197,6 @@ const SHARD_BITS: u32 = 8;
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, thread};
-
     use super::*;
 
     #[test]
@@ -217,7 +215,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]   //  Too long in MIRI.
     fn unique_ids() {
+        use std::{collections::HashSet, thread};
+
         const NB_SAMPLES: usize = 1024;
         const NB_THREADS: usize = 8;
 

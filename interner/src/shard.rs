@@ -193,6 +193,7 @@ pub(crate) struct MapMetadata {
 //  Implementation
 //
 
+const GROUP_LENGTH: usize = 16;
 const JAGGED_LENGTH: usize = 16;
 const PROBING_SEQUENCE: [u64; 4] = [0, 1, 3, 7];
 const SLICE_LENGTH_BYTES: u64 = mem::size_of::<SliceLength>() as u64;
@@ -342,7 +343,9 @@ impl Store {
     where
         A: Allocator,
     {
-        for (index, (length, pointer)) in self.lengths.iter().zip(self.parts.iter()).enumerate() {
+        for (part, (length, pointer)) in self.lengths.iter().zip(self.parts.iter()).enumerate() {
+            let part = PartIndex(part);
+
             length.store(0, Ordering::Relaxed);
 
             let pointer = pointer.swap(ptr::null_mut(), Ordering::Relaxed);
@@ -351,8 +354,8 @@ impl Store {
 
             //  Safety:
             //  -   `pointer` is currently allocated by this allocator.
-            //  -   `pointer` was allocated with this `index`.
-            unsafe { director.deallocate_bytes(pointer, PartIndex(index)) };
+            //  -   `pointer` was allocated with this `part`.
+            unsafe { director.deallocate_bytes(pointer, part) };
         }
     }
 
@@ -591,13 +594,15 @@ impl Store {
 unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
 
+#[derive(Default)]
 struct Map([AtomicPtr<MapGroup>; JAGGED_LENGTH]);
 
 //  Ensure the header is aligned on 16-bytes boundary, for SIMD instructions.
+#[derive(Default)]
 #[repr(C, align(16))]
 struct MapGroup {
-    header: [AtomicU8; 16],
-    elements: [AtomicU32; 16],
+    header: [AtomicU8; GROUP_LENGTH],
+    elements: [AtomicU32; GROUP_LENGTH],
 }
 
 impl Map {
@@ -616,13 +621,10 @@ impl Map {
             let pointer = pointer.swap(ptr::null_mut(), Ordering::Relaxed);
             let Some(pointer) = NonNull::new(pointer) else { continue };
 
-            let number_bytes = director.groups_of(part) * mem::size_of::<MapGroup>();
-            let layout = Layout::from_size_align(number_bytes, 1).unwrap();
-
             //  Safety:
             //  -   `pointer` is currently allocated by this allocator.
-            //  -   `layout` was the layout used for the allocation.
-            unsafe { director.allocator.deallocate(pointer.cast(), layout) };
+            //  -   `pointer` was allocated with this `part`.
+            unsafe { director.deallocate_groups(pointer, part) };
         }
     }
 
@@ -791,6 +793,7 @@ impl Map {
     where
         A: Allocator,
     {
+        debug_assert_ne!(0, residual);
         debug_assert!(residual < 128);
         debug_assert_eq!(group.header.len(), group.elements.len());
 
@@ -809,6 +812,7 @@ impl Map {
 
                         match result {
                             Ok(offset) => {
+                                element.store(offset.0.get(), Ordering::Relaxed);
                                 header.store(residual, Ordering::Release);
                                 return Ok(offset);
                             }
@@ -1023,16 +1027,9 @@ mod tests {
     }
 
     impl TestStore<Global> {
+        //  Creates an instance, inference-friendly.
         fn new(number_bytes: usize) -> Self {
-            let log_number_shards = 4;
-            let log_initial_bytes = number_bytes.ilog2() as u8;
-            let log_initial_groups = 3;
-            let allocator = Global::default();
-
-            let director = ShardDirector::new(log_number_shards, log_initial_bytes, log_initial_groups, allocator);
-            let store = Store::default();
-
-            Self { director, store }
+            Self::with_allocator(number_bytes, Global::default())
         }
     }
 
@@ -1040,7 +1037,17 @@ mod tests {
     where
         A: Allocator,
     {
-        //  TODO: with_allocator.
+        //  Creates an instance.
+        fn with_allocator(number_bytes: usize, allocator: A) -> Self {
+            let log_number_shards = 4;
+            let log_initial_bytes = number_bytes.ilog2() as u8;
+            let log_initial_groups = 3;
+
+            let director = ShardDirector::new(log_number_shards, log_initial_bytes, log_initial_groups, allocator);
+            let store = Store::default();
+
+            Self { director, store }
+        }
 
         //  Gets the slice associated to the offset.
         //
@@ -1074,4 +1081,126 @@ mod tests {
             unsafe { self.store.reset(&self.director) };
         }
     }
+
+    #[test]
+    fn map_insert_first() {
+        //  Checks that a single item can be inserted in an empty Map.
+
+        const SLICE: &[u8] = b"Allo";
+        const HASH: u64 = 0;
+
+        let map = TestMap::new(8, 128);
+
+        let offset = map.insert(HASH, SLICE).expect("Success");
+
+        assert_eq!(4, offset.0.get());
+    }
+
+    #[test]
+    fn map_insert_duplicates() {
+        //  Checks that even after multiple insertions, duplicates are correctly de-duplicated.
+
+        const SLICES: &[&[u8]] = &[b"Allo", b"Baby", b"Cassonade"];
+        const HASH: u64 = 0;
+
+        let map = TestMap::new(8, 128);
+
+        let offsets: Vec<Offset> = SLICES
+            .iter()
+            .map(|slice| map.insert(HASH, slice).expect("Success"))
+            .collect();
+
+        assert_eq!(4, offsets[0].0.get());
+        assert_eq!(12, offsets[1].0.get());
+        assert_eq!(20, offsets[2].0.get());
+
+        let re_offsets: Vec<Offset> = SLICES
+            .iter()
+            .map(|slice| map.insert(HASH, slice).expect("Success"))
+            .collect();
+
+        assert_eq!(offsets, re_offsets);
+    }
+
+    #[test]
+    #[cfg(not(miri))]   //  Too long in MIRI.
+    fn map_insert_many_collisions() {
+        //  Checks that even in the presence of many collisions, different slices still get different offsets.
+
+        //  Simulating a _really_ bad hash function.
+        const HASH: u64 = 0;
+
+        //  16 entries initially, means a _single_ group initially.
+        let map = TestMap::new(8, 16);
+
+        let mut offsets = Vec::new();
+
+        //  This nested loop will generate enough variant strings to fill up 42 groups.
+        for first in b'a'..=b'z' {
+            for second in b'a'..=b'z' {
+                let array = [first, second];
+
+                offsets.push(map.insert(HASH, &array).expect("Success"));
+            }
+        }
+
+        assert!(offsets.windows(2).all(|duo| duo[0].0.get() < duo[1].0.get()),
+            "Expected offsets to be unique, but got {offsets:?}");
+    }
+
+    struct TestMap<A = Global>
+    where
+        A: Allocator,
+    {
+        director: ShardDirector<A>,
+        store: Store,
+        map: Map,
+    }
+
+    impl TestMap<Global> {
+        //  Creates an instance, inference-friendly.
+        fn new(number_bytes: usize, number_entries: usize) -> Self {
+            Self::with_allocator(number_bytes, number_entries, Global::default())
+        }
+    }
+
+    impl<A> TestMap<A>
+    where
+        A: Allocator,
+    {
+        //  Creates an instance.
+        fn with_allocator(number_bytes: usize, number_entries: usize, allocator: A) -> Self {
+            let log_number_shards = 4;
+            let log_initial_bytes = number_bytes.ilog2() as u8;
+            let log_initial_groups = (number_entries / GROUP_LENGTH).ilog2() as u8;
+
+            let director = ShardDirector::new(log_number_shards, log_initial_bytes, log_initial_groups, allocator);
+            let store = Store::default();
+            let map = Map::default();
+
+            Self { director, store, map }
+        }
+
+        //  Intern the slice in the map.
+        fn insert(&self, hash: u64, slice: &[u8]) -> Result<Offset, InternerError> {
+            //  Safety:
+            //  -   This `director` has been used for all previous insertions in this instance and `store`.
+            unsafe { self.map.insert(hash, slice, &self.store, &self.director) }
+        }
+    }
+
+    impl<A> Drop for TestMap<A>
+    where
+        A: Allocator,
+    {
+        fn drop(&mut self) {
+            //  Safety:
+            //  -   This `director` has been used for all allocations.
+            unsafe {
+                self.map.reset(&self.director);
+                self.store.reset(&self.director);
+            }
+        }
+    }
+
 } // mod tests
