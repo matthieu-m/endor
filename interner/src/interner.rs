@@ -24,24 +24,22 @@ pub struct Interner<H = DefaultFxBuildHasher, A = Global>(NonNull<InternerHeader
 where
     A: Allocator;
 
-impl<H, A> Interner<H, A>
-where
-    A: Allocator,
-{
+impl Interner<DefaultFxBuildHasher, Global> {
     /// Creates a new Interner, with default configuration.
     ///
     /// This may fail either because the pool of IDs is exhausted, or because the allocator cannot currently allocate
     /// enough memory for the Interner.
     ///
     /// To customize the Interner, use the `with()` method instead.
-    pub fn new() -> Result<Self, InternerError>
-    where
-        H: Default,
-        A: Default,
-    {
-        Self::with(H::default(), A::default()).build()
+    pub fn new() -> Result<Self, InternerError> {
+        Self::with(DefaultFxBuildHasher::default(), Global::default()).build()
     }
+}
 
+impl<H, A> Interner<H, A>
+where
+    A: Allocator,
+{
     /// Creates a builder for the Interner, allowing finer-grained tuning.
     pub fn with(hasher: H, allocator: A) -> InternerBuilder<H, A> {
         let id = None;
@@ -135,7 +133,7 @@ where
     /// Inserts a string.
     ///
     /// Returns the `StringId` which can be used to retrieve this string, or an error if insertion fails.
-    pub fn insert_string(&self, string: &str) -> Result<StringId, InternerError> {
+    pub fn insert_str(&self, string: &str) -> Result<StringId, InternerError> {
         let bytes = self.insert_bytes(string.as_bytes())?;
 
         //  Safety:
@@ -185,7 +183,7 @@ where
 
         let number_shards = director.number_shards();
 
-        let layout = Self::layout(number_shards.ilog2() as u8);
+        let layout = Self::layout(number_shards);
 
         //  Safety:
         //  -   `self.0` will no longer be used: this was the last reference, and this is the last line.
@@ -363,22 +361,20 @@ impl<H, A> Interner<H, A>
 where
     A: Allocator,
 {
-    fn layout(log_number_shards: u8) -> Layout {
-        let number_shards = 1usize << log_number_shards;
-
+    fn layout(number_shards: usize) -> Layout {
         let header_layout = Layout::new::<InternerHeader<H, A>>();
         let shards_layout = Layout::array::<Shard>(number_shards).expect("Sufficiently low number of shards");
 
         let (layout, offset) = header_layout
             .extend(shards_layout)
             .expect("Sufficiently low number of shards");
-        assert_eq!(0, offset);
+        assert_eq!(header_layout.size(), offset);
 
         layout
     }
 
     fn allocate(id: Id, hasher: H, director: ShardDirector<A>) -> Result<Self, InternerError> {
-        let layout = Self::layout(director.number_shards() as u8);
+        let layout = Self::layout(director.number_shards());
 
         let memory = director
             .allocator()
@@ -543,6 +539,8 @@ pub mod compile_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     fn ensure_send<T: Send>() {}
@@ -556,5 +554,92 @@ mod tests {
     #[test]
     fn interner_sync() {
         ensure_sync::<Interner>();
+    }
+
+    #[test]
+    fn interner_insert_get_bytes() {
+        //  Checks that an inserted sequence of bytes can be retrieved.
+
+        const SLICE: &[u8] = b"Hello, World!";
+
+        let interner = Interner::new().expect("Interner");
+
+        let id = interner.insert_bytes(SLICE).expect("Success");
+
+        let retrieved = interner.get_bytes(id).expect("No mismatch");
+
+        assert_eq!(SLICE, retrieved);
+    }
+
+    #[test]
+    fn interner_insert_get_str() {
+        //  Checks that an inserted string can be retrieved.
+
+        const STRING: &str = "Hello, World!";
+
+        let interner = Interner::new().expect("Interner");
+
+        let id = interner.insert_str(STRING).expect("Success");
+
+        let retrieved = interner.get_str(id).expect("No mismatch");
+
+        assert_eq!(STRING, retrieved);
+    }
+
+    #[test]
+    fn interner_duplicate_bytes() {
+        //  Checks that duplicate slices are properly de-duplicated.
+
+        const SLICES: &[&[u8]] = &[b"Allo", b"Baby", b"Cassonade"];
+
+        let interner = Interner::new().expect("Interner");
+
+        let ids: Vec<_> = SLICES.iter().map(|s| interner.insert_bytes(s).expect("Successful Insertion")).collect();
+
+        assert_eq!(SLICES.len(), ids.len());
+
+        assert_eq!(SLICES.len(), ids.iter().copied().collect::<HashSet<_>>().len());
+
+        let re_ids: Vec<_> = SLICES.iter().map(|s| interner.insert_bytes(s).expect("Successful Insertion")).collect();
+
+        assert_eq!(ids, re_ids);
+    }
+
+    #[test]
+    fn interner_duplicate_strs() {
+        //  Checks that duplicate strings are properly de-duplicated.
+
+        const STRINGS: &[&str] = &["Allo", "Baby", "Cassonade"];
+
+        let interner = Interner::new().expect("Interner");
+
+        let ids: Vec<_> = STRINGS.iter().map(|s| interner.insert_str(s).expect("Successful Insertion")).collect();
+
+        assert_eq!(STRINGS.len(), ids.len());
+
+        assert_eq!(STRINGS.len(), ids.iter().copied().collect::<HashSet<_>>().len());
+
+        let re_ids: Vec<_> = STRINGS.iter().map(|s| interner.insert_str(s).expect("Successful Insertion")).collect();
+
+        assert_eq!(ids, re_ids);
+    }
+
+    #[test]
+    fn interner_duplicate_mixeds() {
+        //  Checks that a duplicate slice and string are de-duplicated.
+
+        const STRINGS: &[&str] = &["Allo", "Baby", "Cassonade"];
+
+        let interner = Interner::new().expect("Interner");
+
+        let ids: Vec<_> = STRINGS.iter().map(|s| interner.insert_str(s).expect("Successful Insertion").as_bytes_id()).collect();
+
+        assert_eq!(STRINGS.len(), ids.len());
+
+        assert_eq!(STRINGS.len(), ids.iter().copied().collect::<HashSet<_>>().len());
+
+        let re_ids: Vec<_> = STRINGS.iter().map(|s| interner.insert_bytes(s.as_bytes()).expect("Successful Insertion")).collect();
+
+        assert_eq!(ids, re_ids);
     }
 } // mod tests

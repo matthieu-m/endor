@@ -39,7 +39,9 @@ impl<A> ShardDirector<A> {
     pub(crate) fn split_hash(&self, hash: u64) -> (ShardIndex, u8, u64) {
         debug_assert!(self.log_number_shards <= 8);
 
-        let shard = (hash & (1u64 << self.log_number_shards)) as u8;
+        let shard_mask = (1u64 << self.log_number_shards) - 1;
+
+        let shard = (hash & shard_mask) as u8;
         let residual = (hash >> 8) as u8 & 0x7F;
         let hash = hash >> 15;
 
