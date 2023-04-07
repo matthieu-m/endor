@@ -68,7 +68,6 @@
 //  Error is very useful...
 #![feature(error_in_core)]
 //  `NonNull` is unfortunately locked away :(
-#![feature(nonnull_slice_from_raw_parts)]
 #![feature(slice_ptr_get)]
 //  Ensure unsafe operations are duly checked.
 #![deny(unsafe_op_in_unsafe_fn)]
