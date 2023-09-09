@@ -32,7 +32,7 @@ impl Interner<DefaultFxBuildHasher, Global> {
     ///
     /// To customize the Interner, use the `with()` method instead.
     pub fn new() -> Result<Self, InternerError> {
-        Self::with(DefaultFxBuildHasher::default(), Global::default()).build()
+        Self::with(DefaultFxBuildHasher::default(), Global).build()
     }
 }
 
@@ -594,13 +594,19 @@ mod tests {
 
         let interner = Interner::new().expect("Interner");
 
-        let ids: Vec<_> = SLICES.iter().map(|s| interner.insert_bytes(s).expect("Successful Insertion")).collect();
+        let ids: Vec<_> = SLICES
+            .iter()
+            .map(|s| interner.insert_bytes(s).expect("Successful Insertion"))
+            .collect();
 
         assert_eq!(SLICES.len(), ids.len());
 
         assert_eq!(SLICES.len(), ids.iter().copied().collect::<HashSet<_>>().len());
 
-        let re_ids: Vec<_> = SLICES.iter().map(|s| interner.insert_bytes(s).expect("Successful Insertion")).collect();
+        let re_ids: Vec<_> = SLICES
+            .iter()
+            .map(|s| interner.insert_bytes(s).expect("Successful Insertion"))
+            .collect();
 
         assert_eq!(ids, re_ids);
     }
@@ -613,13 +619,19 @@ mod tests {
 
         let interner = Interner::new().expect("Interner");
 
-        let ids: Vec<_> = STRINGS.iter().map(|s| interner.insert_str(s).expect("Successful Insertion")).collect();
+        let ids: Vec<_> = STRINGS
+            .iter()
+            .map(|s| interner.insert_str(s).expect("Successful Insertion"))
+            .collect();
 
         assert_eq!(STRINGS.len(), ids.len());
 
         assert_eq!(STRINGS.len(), ids.iter().copied().collect::<HashSet<_>>().len());
 
-        let re_ids: Vec<_> = STRINGS.iter().map(|s| interner.insert_str(s).expect("Successful Insertion")).collect();
+        let re_ids: Vec<_> = STRINGS
+            .iter()
+            .map(|s| interner.insert_str(s).expect("Successful Insertion"))
+            .collect();
 
         assert_eq!(ids, re_ids);
     }
@@ -632,13 +644,19 @@ mod tests {
 
         let interner = Interner::new().expect("Interner");
 
-        let ids: Vec<_> = STRINGS.iter().map(|s| interner.insert_str(s).expect("Successful Insertion").as_bytes_id()).collect();
+        let ids: Vec<_> = STRINGS
+            .iter()
+            .map(|s| interner.insert_str(s).expect("Successful Insertion").as_bytes_id())
+            .collect();
 
         assert_eq!(STRINGS.len(), ids.len());
 
         assert_eq!(STRINGS.len(), ids.iter().copied().collect::<HashSet<_>>().len());
 
-        let re_ids: Vec<_> = STRINGS.iter().map(|s| interner.insert_bytes(s.as_bytes()).expect("Successful Insertion")).collect();
+        let re_ids: Vec<_> = STRINGS
+            .iter()
+            .map(|s| interner.insert_bytes(s.as_bytes()).expect("Successful Insertion"))
+            .collect();
 
         assert_eq!(ids, re_ids);
     }

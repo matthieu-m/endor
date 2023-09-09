@@ -8,3 +8,6 @@ repository = "https://github.com/matthieu-m/endor"
 license = "MIT OR Apache-2.0"
 keywords = ["experimental", "compiler", "interner", "interning"]
 categories = ["compilers", "concurrency", "data-structures", "memory-management", "no-std"]
+
+[dev-dependencies]
+bursty = "0.1.0"

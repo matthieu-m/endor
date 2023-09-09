@@ -274,7 +274,9 @@ where
     A: Allocator,
 {
     fn allocate_bytes(&self, index: PartIndex) -> Result<NonNull<u8>, InternerError> {
-        let Some(layout) = self.layout_bytes(index) else { return Err(InternerError::MemoryExhausted) };
+        let Some(layout) = self.layout_bytes(index) else {
+            return Err(InternerError::MemoryExhausted);
+        };
 
         self.allocator
             .allocate_zeroed(layout)
@@ -283,7 +285,9 @@ where
     }
 
     fn allocate_groups(&self, index: PartIndex) -> Result<NonNull<MapGroup>, InternerError> {
-        let Some(layout) = self.layout_groups(index) else { return Err(InternerError::MemoryExhausted) };
+        let Some(layout) = self.layout_groups(index) else {
+            return Err(InternerError::MemoryExhausted);
+        };
 
         self.allocator
             .allocate_zeroed(layout)
@@ -405,7 +409,7 @@ impl Store {
             offset: inner.0,
         };
 
-        debug_assert!(part.0 < self.parts.len());
+        debug_assert!(part.0 < self.parts.len(), "{} < {}", part.0, self.parts.len());
 
         //  Safety:
         //  -   `part` is within bounds, since `offset` exists.
@@ -413,11 +417,21 @@ impl Store {
 
         let pointer = pointer.load(Ordering::Relaxed);
 
-        debug_assert!(inner.0 < director.bytes_of(part));
-        debug_assert!((inner.0 as u64) < self.lengths[part.0].load(Ordering::Relaxed));
+        debug_assert!(
+            inner.0 < director.bytes_of(part),
+            "{} < {}",
+            inner.0,
+            director.bytes_of(part)
+        );
+        debug_assert!(
+            (inner.0 as u64) <= self.lengths[part.0].load(Ordering::Relaxed),
+            "{} <= {}",
+            inner.0,
+            self.lengths[part.0].load(Ordering::Relaxed)
+        );
 
         //  Safety:
-        //  -   `inner` is guaranteed to be within the allocation.
+        //  -   `inner` is guaranteed to be within the allocation, or one past its end.
         let pointer = unsafe { pointer.add(inner.0) };
 
         debug_assert!(inner.0 >= mem::size_of::<SliceLength>());
@@ -529,7 +543,9 @@ impl Store {
             NonZeroU32::new(offset)
         };
 
-        let Some(offset) = offset() else { return Err(InternerError::ByteStorageExhausted) };
+        let Some(offset) = offset() else {
+            return Err(InternerError::ByteStorageExhausted);
+        };
 
         //  Got beaten to the punch, bail out and let the outer loop move on to the next part.
         if previous_part_length + length + SLICE_LENGTH_BYTES > number_bytes {
@@ -994,7 +1010,7 @@ mod tests {
         assert_eq!(12, offsets[3].0.get()); //  2nd part, offset by slice length.
         assert_eq!(36, offsets[4].0.get()); //  4th part, offset by slice length.
 
-        for (expected, offset) in SLICES.iter().zip(offsets.into_iter()) {
+        for (expected, offset) in SLICES.iter().zip(offsets) {
             //  Safety:
             //  -   `offset` was obtained from `store`.
             //  -   `store.store` was not reset since `offset` was obtained.
@@ -1031,7 +1047,7 @@ mod tests {
     impl TestStore<Global> {
         //  Creates an instance, inference-friendly.
         fn new(number_bytes: usize) -> Self {
-            Self::with_allocator(number_bytes, Global::default())
+            Self::with_allocator(number_bytes, Global)
         }
     }
 
@@ -1125,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(miri))]   //  Too long in MIRI.
+    #[cfg(not(miri))] //  Too long in MIRI.
     fn map_insert_many_collisions() {
         //  Checks that even in the presence of many collisions, different slices still get different offsets.
 
@@ -1146,8 +1162,10 @@ mod tests {
             }
         }
 
-        assert!(offsets.windows(2).all(|duo| duo[0].0.get() < duo[1].0.get()),
-            "Expected offsets to be unique, but got {offsets:?}");
+        assert!(
+            offsets.windows(2).all(|duo| duo[0].0.get() < duo[1].0.get()),
+            "Expected offsets to be unique, but got {offsets:?}"
+        );
     }
 
     struct TestMap<A = Global>
@@ -1162,7 +1180,7 @@ mod tests {
     impl TestMap<Global> {
         //  Creates an instance, inference-friendly.
         fn new(number_bytes: usize, number_entries: usize) -> Self {
-            Self::with_allocator(number_bytes, number_entries, Global::default())
+            Self::with_allocator(number_bytes, number_entries, Global)
         }
     }
 
@@ -1204,5 +1222,4 @@ mod tests {
             }
         }
     }
-
 } // mod tests

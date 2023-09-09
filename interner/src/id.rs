@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(miri))]   //  Too long in MIRI.
+    #[cfg(not(miri))] //  Too long in MIRI.
     fn unique_ids() {
         use std::{collections::HashSet, thread};
 
