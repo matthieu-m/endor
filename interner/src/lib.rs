@@ -65,8 +65,6 @@
 #![cfg_attr(not(test), no_std)]
 //  Collections should use flexible allocators.
 #![feature(allocator_api)]
-//  Error is very useful...
-#![feature(error_in_core)]
 //  `NonNull` is unfortunately locked away :(
 #![feature(slice_ptr_get)]
 //  Ensure unsafe operations are duly checked.
