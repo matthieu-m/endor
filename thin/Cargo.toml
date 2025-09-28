@@ -1,0 +1,19 @@
+[package]
+name = "endor-thin"
+version = "0.1.0"
+authors = ["Matthieu M. <matthieum.147192@gmail.com>"]
+edition = "2024"
+description = "Thin pointer, in various forms"
+repository = "https://github.com/matthieu-m/endor"
+license = "MIT OR Apache-2.0"
+keywords = ["experimental", "compiler", "pointer"]
+categories = ["compilers", "concurrency", "data-structures", "memory-management", "no-std::no-alloc"]
+
+[features]
+
+#   Enables the use of the `Allocator` trait, which implies the use of a nightly toolchain.
+alloc = []
+
+[dependencies]
+
+#   None
