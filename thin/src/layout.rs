@@ -1,7 +1,7 @@
 //! The layout of a thin pointer memory block.
 
 use core::{
-    alloc::Layout,
+    alloc::{Layout, LayoutError},
     hint,
     ptr::{self, NonNull, Pointee},
 };
@@ -20,8 +20,6 @@ pub struct ThinLayout {
 
 impl ThinLayout {
     /// Constructs a new instance.
-    ///
-    /// Returns an error on arithmetic overflow.
     ///
     /// #   Layout Invariance
     ///
@@ -48,34 +46,29 @@ impl ThinLayout {
         let metadata = Layout::new::<<U as Pointee>::Metadata>();
         let allocator = Layout::new::<Packed<A>>();
 
-        //  Safety:
-        //  -   The compiler did not error on `Block`, therefore the layout will not overflow.
-        let Ok((hm, hm_offset)) = header.extend(metadata) else {
-            unsafe { hint::unreachable_unchecked() }
-        };
-        let Ok((fh, fh_offset)) = hm.extend(allocator) else {
-            unsafe { hint::unreachable_unchecked() }
-        };
-        let Ok((unaligned_block, block_offset)) = fh.extend(data) else {
+        let Ok(this) = Self::compute_layout(data, header, metadata, allocator) else {
+            //  Safety:
+            //  -   The compiler did not error on `Block`, therefore the layout will not overflow.
             unsafe { hint::unreachable_unchecked() }
         };
 
-        let block = unaligned_block.pad_to_align();
-        let header_offset = header.size();
-        let metadata_offset = hm_offset + metadata.size();
-        let allocator_offset = fh_offset + allocator.size();
-        let start_offset = block_offset + (block.size() - unaligned_block.size());
+        debug_assert!(Layout::new::<Block<T, H, U, A>>().size() == this.block().size());
+        debug_assert!(Layout::new::<Block<T, H, U, A>>().align() == this.block().align());
 
-        debug_assert!(Layout::new::<Block<T, H, U, A>>().size() == block.size());
-        debug_assert!(Layout::new::<Block<T, H, U, A>>().align() == block.align());
+        this
+    }
 
-        Self {
-            block,
-            header_offset,
-            metadata_offset,
-            allocator_offset,
-            start_offset,
-        }
+    /// Constructs a new instance from a raw value.
+    pub const fn for_value<T, H, A>(value: &T) -> Result<Self, LayoutError>
+    where
+        T: ?Sized,
+    {
+        let data = Layout::for_value::<T>(value);
+        let header = Layout::new::<H>();
+        let metadata = Layout::new::<<T as Pointee>::Metadata>();
+        let allocator = Layout::new::<Packed<A>>();
+
+        Self::compute_layout(data, header, metadata, allocator)
     }
 
     /// Returns the layout of the complete block.
@@ -145,6 +138,44 @@ impl ThinLayout {
 //
 //  Implementation
 //
+
+impl ThinLayout {
+    const fn compute_layout(
+        data: Layout,
+        header: Layout,
+        metadata: Layout,
+        allocator: Layout,
+    ) -> Result<Self, LayoutError> {
+        let (hm, hm_offset) = match header.extend(metadata) {
+            Ok(extended) => extended,
+            Err(e) => return Err(e),
+        };
+
+        let (fh, fh_offset) = match hm.extend(allocator) {
+            Ok(extended) => extended,
+            Err(e) => return Err(e),
+        };
+
+        let (unaligned_block, block_offset) = match fh.extend(data) {
+            Ok(extended) => extended,
+            Err(e) => return Err(e),
+        };
+
+        let block = unaligned_block.pad_to_align();
+        let header_offset = header.size();
+        let metadata_offset = hm_offset + metadata.size();
+        let allocator_offset = fh_offset + allocator.size();
+        let start_offset = block_offset + (block.size() - unaligned_block.size());
+
+        Ok(Self {
+            block,
+            header_offset,
+            metadata_offset,
+            allocator_offset,
+            start_offset,
+        })
+    }
+}
 
 #[repr(C, packed(1))]
 struct Packed<T>(T);

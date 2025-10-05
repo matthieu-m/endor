@@ -42,12 +42,16 @@
 //  Features (library)
 #![feature(alloc_layout_extra)]
 #![feature(allocator_api)]
+#![feature(const_heap)]
 #![feature(const_option_ops)]
+#![feature(core_intrinsics)]
 #![feature(phantom_variance_markers)]
 #![feature(ptr_metadata)]
 #![feature(slice_ptr_get)]
 #![feature(unsize)]
 //  Lints
+//  Required for core_intrinsics, itself mandatory to obtain a suitably aligned memory block at compile-time.
+#![allow(internal_features)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 
@@ -64,3 +68,15 @@ pub use atomic::{ThinAtomicPtr, ThinAtomicPtrWith};
 pub use layout::ThinLayout;
 pub use nonnull::{ThinNonNull, ThinNonNullWith};
 pub use ptr::{ThinPtr, ThinPtrWith};
+
+#[cfg(feature = "alloc")]
+mod boxed;
+
+#[cfg(feature = "alloc")]
+mod raw;
+
+#[cfg(feature = "alloc")]
+pub use boxed::{ThinBox, ThinBoxWith};
+
+#[cfg(feature = "alloc")]
+pub(crate) use raw::ThinRawWith;

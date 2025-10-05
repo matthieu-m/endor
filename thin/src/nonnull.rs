@@ -15,6 +15,7 @@ use crate::ThinPtrWith;
 pub type ThinNonNull<T> = ThinNonNullWith<T, ()>;
 
 /// The thin equivalent of `NonNull<T>`, with a header of the user's choice.
+#[repr(transparent)]
 pub struct ThinNonNullWith<T, H>
 where
     T: ?Sized,
