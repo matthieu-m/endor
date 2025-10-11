@@ -2,13 +2,16 @@
 
 use core::{
     alloc::Layout,
-    hint, intrinsics,
+    hint,
     marker::{PhantomInvariant, Unsize},
     mem::{self, MaybeUninit},
     ptr::{self, NonNull},
 };
 
-use alloc::alloc::{AllocError, Allocator};
+use alloc::{
+    alloc::{AllocError, Allocator},
+    boxed::ThinBox,
+};
 
 use crate::{ThinLayout, ThinNonNullWith};
 
@@ -302,58 +305,17 @@ where
     where
         T: Unsize<U>,
     {
-        let is_value_zst = mem::size_of::<T>() == 0 && mem::size_of::<H>() == 0 && mem::size_of::<A>() == 0;
-
-        let metadata = ptr::metadata(&value as &U);
-
-        if is_value_zst && mem::size_of_val(&metadata) == 0 {
-            mem::forget(value);
-            mem::forget(header);
-            mem::forget(allocator);
-
-            let layout = ThinLayout::new::<T, H, U, A>();
-
-            return Ok(layout.dangling());
-        }
+        let is_value_zst = const { mem::size_of::<T>() == 0 && mem::size_of::<H>() == 0 && mem::size_of::<A>() == 0 };
 
         if is_value_zst {
             mem::forget(header);
             mem::forget(allocator);
 
-            //  Must be done in a const block, to ensure the allocation is really a constant-time allocation.
-            let ptr = const {
-                let layout = ThinLayout::new::<T, H, U, A>();
-
-                let block = layout.block();
-
-                //  Safety:
-                //  -   CompileTime: within a `const` block.
-                let start = unsafe { intrinsics::const_allocate(block.size(), block.align()) };
-
-                //  Safety:
-                //  -   InBounds: allocated as per layout.
-                let ptr = unsafe { start.add(layout.start_offset()) };
-
-                let metadata = ptr::metadata::<U>(ptr::dangling::<T>() as *const U);
-
-                //  Safety:
-                //  -   Valid: freshly allocated.
-                //  -   Aligned: allocated as per layout.
-                unsafe { ptr::write(ptr.sub(layout.metadata_offset()) as *mut _, metadata) };
-
-                //  Safety:
-                //  -   No prerequisite. Mimicks unstable alloc::boxed::ThinBox.
-                unsafe { intrinsics::const_make_global(start) };
-
-                ptr
-            };
-
-            //  Safety:
-            //  -   NonNull: `const_allocate` does not return null pointers at compile-time.
-            return Ok(unsafe { NonNull::new_unchecked(ptr) });
+            return Self::try_raw_unsize_szt(value);
         }
 
         let layout = ThinLayout::new::<T, H, U, A>();
+        let metadata = ptr::metadata(&value as &U);
 
         let ptr = allocator.allocate(layout.block()).map(NonNull::as_non_null_ptr)?;
 
@@ -375,7 +337,244 @@ where
 
         Ok(ptr)
     }
+
+    //  Safety:
+    //  -   Suitable: the allocated memory is suitable.
+    fn try_raw_unsize_szt<T>(value: T) -> Result<NonNull<u8>, AllocError>
+    where
+        T: Unsize<U>,
+    {
+        //  ThinBox implements a clever trick to avoid allocating _just_ for metadata, by instead creating a static
+        //  variable with said metadata, in a block of memory suitably aligned for it.
+        //
+        //  Using this trick is desirable, obviously, but hard to achieve. It relies on compiler intrinsics, which are
+        //  never intended for stabilization, and worse, poorly documented and finnicky to use, easily leading to
+        //  internal compiler errors.
+        //
+        //  Instead, the trick is therefore to leverage ThinBox to perform this trick for us. The difficulty is in
+        //  obtaining out of it a block of memory that is suitably aligned not only for `T`, but also for `H`.
+        //
+        //  Using `[H; 0]` will force ThinBox to over-align the pointer it uses, if `T` was not aligned enough. This is
+        //  a good _start_, as it guarantees that `ptr.sub(layout.header_offset)` will be sufficiently aligned. It does
+        //  not, however, guarantee that this pointer will be non-null.
+        //
+        //  The pointer could be null: ThinBox only offsets the pointer "just" enough to place the metadata in:
+        //
+        //  -   If the alignment of `([H; 0], T)` is less than or equal to the size & alignment of the metadata.
+        //  -   If the alignment of `H` is greater than or equal to that of `T`.
+        //
+        //  There is no way to force ThinBox to have a greater offset from zero, other than alignment, and therefore
+        //  we will tweak the layout by using an overaligned struct.
+        use core::ptr::Pointee;
+
+        use aligned::*;
+
+        fn allocate_zst<T, DH, U>(value: T) -> NonNull<u8>
+        where
+            T: Unsize<U>,
+            U: ?Sized,
+        {
+            struct Block<DH, T: ?Sized> {
+                _header: [DH; 0],
+                _t: T,
+            }
+
+            let block: Block<DH, T> = Block { _header: [], _t: value };
+
+            assert_eq!(0, mem::size_of_val(&block));
+
+            let mut thin: ThinBox<Block<DH, U>> = ThinBox::new_unsize(block);
+
+            //  Miri complains that this only gives access to [0x10..0x10] in the memory block, and not [0x8..0x10],
+            //  that is, that this does not allow accessing the metadata stored prior to T, when using the Stacked
+            //  Borrows model. It accepts the code with the Tree Borrows model.
+            let ptr = NonNull::from_mut(&mut *thin);
+
+            mem::forget(thin);
+
+            ptr.cast()
+        }
+
+        let min_align = const {
+            let h = mem::align_of::<H>();
+
+            //  Commonly (2, 2) on 16-bits platforms, (4, 4) on 32-bits platforms, and (8, 8) on 64-bits platforms...
+            //  ... but there's no reason not to make it just work.
+            let m = Layout::new::<<U as Pointee>::Metadata>();
+
+            let m = if m.size() > m.align() {
+                //  If it overflows an returns 0, the next match will lead to Err(AllocError): perfect!
+                m.size().next_power_of_two()
+            } else {
+                m.align()
+            };
+
+            if h > m { h } else { m }
+        };
+
+        match min_align {
+            1 => Ok(allocate_zst::<T, Align_2, U>(value)),
+            2 => Ok(allocate_zst::<T, Align_4, U>(value)),
+            4 => Ok(allocate_zst::<T, Align_8, U>(value)),
+            8 => Ok(allocate_zst::<T, Align_16, U>(value)),
+            16 => Ok(allocate_zst::<T, Align_32, U>(value)),
+            32 => Ok(allocate_zst::<T, Align_64, U>(value)),
+            64 => Ok(allocate_zst::<T, Align_128, U>(value)),
+            128 => Ok(allocate_zst::<T, Align_256, U>(value)),
+            256 => Ok(allocate_zst::<T, Align_512, U>(value)),
+            512 => Ok(allocate_zst::<T, Align_1_024, U>(value)),
+            1_024 => Ok(allocate_zst::<T, Align_2_048, U>(value)),
+            2_048 => Ok(allocate_zst::<T, Align_4_096, U>(value)),
+            4_096 => Ok(allocate_zst::<T, Align_8_192, U>(value)),
+            8_192 => Ok(allocate_zst::<T, Align_16_384, U>(value)),
+            16_384 => Ok(allocate_zst::<T, Align_32_768, U>(value)),
+            32_768 => Ok(allocate_zst::<T, Align_65_536, U>(value)),
+            65_536 => Ok(allocate_zst::<T, Align_131_072, U>(value)),
+            131_072 => Ok(allocate_zst::<T, Align_262_144, U>(value)),
+            262_144 => Ok(allocate_zst::<T, Align_524_288, U>(value)),
+            524_288 => Ok(allocate_zst::<T, Align_1_048_576, U>(value)),
+            1_048_576 => Ok(allocate_zst::<T, Align_2_097_152, U>(value)),
+            2_097_152 => Ok(allocate_zst::<T, Align_4_194_304, U>(value)),
+            4_194_304 => Ok(allocate_zst::<T, Align_8_388_608, U>(value)),
+            8_388_608 => Ok(allocate_zst::<T, Align_16_777_216, U>(value)),
+            16_777_216 => Ok(allocate_zst::<T, Align_33_554_432, U>(value)),
+            33_554_432 => Ok(allocate_zst::<T, Align_67_108_864, U>(value)),
+            67_108_864 => Ok(allocate_zst::<T, Align_134_217_728, U>(value)),
+            134_217_728 => Ok(allocate_zst::<T, Align_268_435_456, U>(value)),
+            268_435_456 => Ok(allocate_zst::<T, Align_536_870_912, U>(value)),
+            _ => Err(AllocError),
+        }
+    }
 }
+
+mod aligned {
+    //  The underscore is very much necessary to see _anything_.
+    #![allow(non_camel_case_types)]
+
+    #[repr(align(2))]
+    pub(super) struct Align_2;
+
+    #[repr(align(4))]
+    pub(super) struct Align_4;
+
+    #[repr(align(8))]
+    pub(super) struct Align_8;
+
+    #[repr(align(16))]
+    pub(super) struct Align_16;
+
+    #[repr(align(32))]
+    pub(super) struct Align_32;
+
+    #[repr(align(64))]
+    pub(super) struct Align_64;
+
+    #[repr(align(128))]
+    pub(super) struct Align_128;
+
+    #[repr(align(256))]
+    pub(super) struct Align_256;
+
+    #[repr(align(512))]
+    pub(super) struct Align_512;
+
+    #[repr(align(1_024))]
+    pub(super) struct Align_1_024;
+
+    #[repr(align(2_048))]
+    pub(super) struct Align_2_048;
+
+    #[repr(align(4_096))]
+    pub(super) struct Align_4_096;
+
+    #[repr(align(8_192))]
+    pub(super) struct Align_8_192;
+
+    #[repr(align(16_384))]
+    pub(super) struct Align_16_384;
+
+    #[repr(align(32_768))]
+    pub(super) struct Align_32_768;
+
+    #[repr(align(65_536))]
+    pub(super) struct Align_65_536;
+
+    #[repr(align(131_072))]
+    pub(super) struct Align_131_072;
+
+    #[repr(align(262_144))]
+    pub(super) struct Align_262_144;
+
+    #[repr(align(524_288))]
+    pub(super) struct Align_524_288;
+
+    #[repr(align(1_048_576))]
+    pub(super) struct Align_1_048_576;
+
+    #[repr(align(2_097_152))]
+    pub(super) struct Align_2_097_152;
+
+    #[repr(align(4_194_304))]
+    pub(super) struct Align_4_194_304;
+
+    #[repr(align(8_388_608))]
+    pub(super) struct Align_8_388_608;
+
+    #[repr(align(16_777_216))]
+    pub(super) struct Align_16_777_216;
+
+    #[repr(align(33_554_432))]
+    pub(super) struct Align_33_554_432;
+
+    #[repr(align(67_108_864))]
+    pub(super) struct Align_67_108_864;
+
+    #[repr(align(134_217_728))]
+    pub(super) struct Align_134_217_728;
+
+    #[repr(align(268_435_456))]
+    pub(super) struct Align_268_435_456;
+
+    #[repr(align(536_870_912))]
+    pub(super) struct Align_536_870_912;
+
+    //  Only alignments up to 2^29 (536MB) are supported.
+
+    #[test]
+    fn alignment() {
+        use core::mem;
+
+        assert!(mem::align_of::<Align_2>() >= 2);
+        assert!(mem::align_of::<Align_4>() >= 4);
+        assert!(mem::align_of::<Align_8>() >= 8);
+        assert!(mem::align_of::<Align_16>() >= 16);
+        assert!(mem::align_of::<Align_32>() >= 32);
+        assert!(mem::align_of::<Align_64>() >= 64);
+        assert!(mem::align_of::<Align_128>() >= 128);
+        assert!(mem::align_of::<Align_256>() >= 256);
+        assert!(mem::align_of::<Align_512>() >= 512);
+        assert!(mem::align_of::<Align_1_024>() >= 1_024);
+        assert!(mem::align_of::<Align_2_048>() >= 2_048);
+        assert!(mem::align_of::<Align_4_096>() >= 4_096);
+        assert!(mem::align_of::<Align_8_192>() >= 8_192);
+        assert!(mem::align_of::<Align_16_384>() >= 16_384);
+        assert!(mem::align_of::<Align_32_768>() >= 32_368);
+        assert!(mem::align_of::<Align_65_536>() >= 65_536);
+        assert!(mem::align_of::<Align_131_072>() >= 131_072);
+        assert!(mem::align_of::<Align_262_144>() >= 262_144);
+        assert!(mem::align_of::<Align_524_288>() >= 524_288);
+        assert!(mem::align_of::<Align_1_048_576>() >= 1_048_576);
+        assert!(mem::align_of::<Align_2_097_152>() >= 2_097_152);
+        assert!(mem::align_of::<Align_4_194_304>() >= 4_194_304);
+        assert!(mem::align_of::<Align_8_388_608>() >= 8_388_608);
+        assert!(mem::align_of::<Align_16_777_216>() >= 16_777_216);
+        assert!(mem::align_of::<Align_33_554_432>() >= 33_554_432);
+        assert!(mem::align_of::<Align_67_108_864>() >= 67_108_864);
+        assert!(mem::align_of::<Align_134_217_728>() >= 134_217_728);
+        assert!(mem::align_of::<Align_268_435_456>() >= 268_435_456);
+        assert!(mem::align_of::<Align_536_870_912>() >= 536_870_912);
+    }
+} // mod aligned
 
 //
 //  Destruction

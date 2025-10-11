@@ -42,16 +42,13 @@
 //  Features (library)
 #![feature(alloc_layout_extra)]
 #![feature(allocator_api)]
-#![feature(const_heap)]
 #![feature(const_option_ops)]
-#![feature(core_intrinsics)]
 #![feature(phantom_variance_markers)]
 #![feature(ptr_metadata)]
 #![feature(slice_ptr_get)]
+#![cfg_attr(any(test, feature = "alloc"), feature(thin_box))]
 #![feature(unsize)]
 //  Lints
-//  Required for core_intrinsics, itself mandatory to obtain a suitably aligned memory block at compile-time.
-#![allow(internal_features)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
 

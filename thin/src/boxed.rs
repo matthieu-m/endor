@@ -423,34 +423,34 @@ where
 {
     /// Returns a reference to the data.
     #[inline(always)]
-    pub const fn as_ref(&self) -> &T {
+    pub const fn as_ref(this: &Self) -> &T {
         //  Safety:
         //  -   Convertible: alive & guarded shared access.
-        unsafe { self.inner.as_ref() }
+        unsafe { this.inner.as_ref() }
     }
 
     /// Returns a reference to the data.
     #[inline(always)]
-    pub const fn as_mut(&mut self) -> &mut T {
+    pub const fn as_mut(this: &mut Self) -> &mut T {
         //  Safety:
         //  -   Convertible: alive & guarded exclusive access.
-        unsafe { self.inner.as_mut() }
+        unsafe { this.inner.as_mut() }
     }
 
     /// Returns a reference to `H`.
     #[inline(always)]
-    pub const fn as_header_ref(&self) -> &H {
+    pub const fn as_header_ref(this: &Self) -> &H {
         //  Safety:
         //  -   Convertible: alive & guarded shared access.
-        unsafe { self.inner.as_header_ref() }
+        unsafe { this.inner.as_header_ref() }
     }
 
     /// Returns a mutable reference to `H`.
     #[inline(always)]
-    pub const fn as_header_mut(&mut self) -> &mut H {
+    pub const fn as_header_mut(this: &mut Self) -> &mut H {
         //  Safety:
         //  -   Convertible: alive & guarded exclusive access.
-        unsafe { self.inner.as_header_mut() }
+        unsafe { this.inner.as_header_mut() }
     }
 }
 
@@ -488,7 +488,7 @@ where
     A: Allocator,
 {
     fn as_ref(&self) -> &T {
-        self.as_ref()
+        Self::as_ref(self)
     }
 }
 
@@ -498,7 +498,7 @@ where
     A: Allocator,
 {
     fn as_mut(&mut self) -> &mut T {
-        self.as_mut()
+        Self::as_mut(self)
     }
 }
 
@@ -510,7 +510,7 @@ where
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.as_ref()
+        Self::as_ref(self)
     }
 }
 
@@ -520,7 +520,7 @@ where
     A: Allocator,
 {
     fn deref_mut(&mut self) -> &mut T {
-        self.as_mut()
+        Self::as_mut(self)
     }
 }
 
@@ -536,8 +536,8 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         f.debug_struct("ThinBoxWith")
-            .field("header", self.as_header_ref())
-            .field("value", &self.as_ref())
+            .field("header", Self::as_header_ref(self))
+            .field("value", &Self::as_ref(self))
             .finish()
     }
 }
@@ -662,3 +662,168 @@ where
     A: Allocator + Sync,
 {
 }
+
+#[cfg(test)]
+mod tests {
+    use core::fmt::Debug;
+
+    use super::*;
+
+    #[test]
+    fn decons_vanilla() {
+        let _ = ThinBox::new(value());
+    }
+
+    #[test]
+    fn decons_with_header() {
+        let _ = ThinBoxWith::new_with(value(), header());
+    }
+
+    #[test]
+    fn decons_unsized() {
+        let _: ThinBox<dyn Debug> = ThinBox::new_unsize(value());
+    }
+
+    #[test]
+    fn decons_unsized_with_header() {
+        let _: ThinBoxWith<dyn Debug, _> = ThinBoxWith::new_unsize_with(value(), header());
+    }
+
+    #[test]
+    fn decons_zst() {
+        let _ = ThinBox::new(());
+    }
+
+    #[test]
+    fn decons_zst_with_header() {
+        let _ = ThinBoxWith::new_with((), header());
+    }
+
+    #[test]
+    fn decons_unsized_zst() {
+        let _: ThinBox<dyn Debug> = ThinBox::new_unsize(());
+    }
+
+    #[test]
+    fn decons_unsized_zst_with_header() {
+        let _: ThinBoxWith<dyn Debug, _> = ThinBoxWith::new_unsize_with((), header());
+    }
+
+    #[test]
+    fn deref_vanilla() {
+        let mut thin = ThinBox::new(value());
+
+        assert_value_mut_str(&mut thin);
+        assert_header_mut_zst(&mut thin);
+    }
+
+    #[test]
+    fn deref_with_header() {
+        let mut thin = ThinBoxWith::new_with(value(), header());
+
+        assert_value_mut_str(&mut thin);
+        assert_header_mut_boxed(&mut thin, 33);
+    }
+
+    #[test]
+    fn deref_unsized() {
+        let mut thin: ThinBox<dyn AsMut<str>> = ThinBox::new_unsize(value());
+
+        assert_value_mut_str(&mut thin);
+        assert_header_mut_zst(&mut thin);
+    }
+
+    #[test]
+    fn deref_unsized_with_header() {
+        let mut thin: ThinBoxWith<dyn AsMut<str>, _> = ThinBoxWith::new_unsize_with(value(), header());
+
+        assert_value_mut_str(&mut thin);
+        assert_header_mut_boxed(&mut thin, 33);
+    }
+
+    #[test]
+    fn deref_zst() {
+        let mut thin = ThinBox::new(());
+
+        assert_value_mut_zst(&mut thin);
+        assert_header_mut_zst(&mut thin);
+    }
+
+    #[test]
+    fn deref_zst_with_header() {
+        let mut thin = ThinBoxWith::new_with((), header());
+
+        assert_value_mut_zst(&mut thin);
+        assert_header_mut_boxed(&mut thin, 33);
+    }
+
+    #[test]
+    fn deref_unsized_zst() {
+        let mut thin: ThinBox<dyn Debug> = ThinBox::new_unsize(());
+
+        assert_header_mut_zst(&mut thin);
+    }
+
+    #[test]
+    fn deref_unsized_zst_with_header() {
+        let mut thin: ThinBoxWith<dyn Debug, _> = ThinBoxWith::new_unsize_with((), header());
+
+        assert_header_mut_boxed(&mut thin, 33);
+    }
+
+    fn assert_value_mut_str<T, H>(thin: &mut ThinBoxWith<T, H>)
+    where
+        T: ?Sized + AsMut<str>,
+    {
+        let t: &mut T = &mut *thin;
+        let s: &mut str = t.as_mut();
+
+        s.make_ascii_lowercase();
+
+        assert_eq!("hello, world!", s);
+    }
+
+    fn assert_value_mut_zst<H>(thin: &mut ThinBoxWith<(), H>) {
+        **thin = ();
+
+        assert_eq!((), **thin);
+    }
+
+    fn assert_header_mut_boxed<T, H>(thin: &mut ThinBoxWith<T, Box<H>>, new_header: H)
+    where
+        T: ?Sized,
+        H: Copy + Debug + Eq,
+    {
+        let header = ThinBoxWith::as_header_mut(thin);
+
+        **header = new_header;
+
+        assert_eq!(new_header, **header);
+    }
+
+    fn assert_header_mut_zst<T>(thin: &mut ThinBoxWith<T, ()>)
+    where
+        T: ?Sized,
+    {
+        let header = ThinBoxWith::as_header_mut(thin);
+
+        *header = ();
+
+        assert_eq!((), *header);
+    }
+
+    //  Why a String?
+    //
+    //  Using a String is the cheapest way to ensure that the destructor is properly called: Miri will error out with
+    //  a memory leak if it is not.
+    fn value() -> String {
+        String::from("Hello, World!")
+    }
+
+    //  Why a Box.
+    //
+    //  Same reason as the String, just a different type.
+    fn header() -> Box<u32> {
+        Box::new(42)
+    }
+} // mod tests
