@@ -2,7 +2,7 @@
 
 use core::{
     alloc::Layout,
-    hint, intrinsics,
+    hint,
     marker::{PhantomInvariant, Unsize},
     mem::{self, MaybeUninit},
     ptr::{self, NonNull},
@@ -316,6 +316,11 @@ where
             return Ok(layout.dangling());
         }
 
+        /*
+        error:
+            internal compiler error: compiler/rustc_const_eval/src/interpret/intern.rs:345:13:
+            the static const safety checks accepted a mutable pointer they should not have accepted
+
         if is_value_zst {
             mem::forget(header);
             mem::forget(allocator);
@@ -345,13 +350,14 @@ where
                 //  -   No prerequisite. Mimicks unstable alloc::boxed::ThinBox.
                 unsafe { intrinsics::const_make_global(start) };
 
-                ptr
+                ptr as *const u8
             };
 
             //  Safety:
             //  -   NonNull: `const_allocate` does not return null pointers at compile-time.
-            return Ok(unsafe { NonNull::new_unchecked(ptr) });
+            return Ok(unsafe { NonNull::new_unchecked(ptr as *mut _) });
         }
+        */
 
         let layout = ThinLayout::new::<T, H, U, A>();
 

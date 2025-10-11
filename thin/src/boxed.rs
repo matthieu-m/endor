@@ -662,3 +662,45 @@ where
     A: Allocator + Sync,
 {
 }
+
+#[cfg(test)]
+mod tests {
+    use core::fmt::Debug;
+
+    use super::*;
+
+    #[test]
+    fn decons_vanilla() {
+        let _ = ThinBox::new(value());
+    }
+
+    #[test]
+    fn decons_with_header() {
+        let _ = ThinBoxWith::new_with(value(), header());
+    }
+
+    #[test]
+    fn decons_unsized() {
+        let _: ThinBox<dyn Debug> = ThinBox::new_unsize(value());
+    }
+
+    #[test]
+    fn decons_unsized_with_header() {
+        let _: ThinBoxWith<dyn Debug, _> = ThinBoxWith::new_unsize_with(value(), header());
+    }
+
+    //  Why a String?
+    //
+    //  Using a String is the cheapest way to ensure that the destructor is properly called: Miri will error out with
+    //  a memory leak if it is not.
+    fn value() -> String {
+        String::from("Hello, World!")
+    }
+
+    //  Why a Box.
+    //
+    //  Same reason as the String, just a different type.
+    fn header() -> Box<u32> {
+        Box::new(42)
+    }
+} // mod tests
