@@ -12,8 +12,8 @@ pub struct ThinLayout {
     //  Layout of the entire block.
     block: Layout,
     //  Backward offsets from thin pointer.
-    header_offset: usize,
     metadata_offset: usize,
+    header_offset: usize,
     allocator_offset: usize,
     start_offset: usize,
 }
@@ -23,10 +23,10 @@ impl ThinLayout {
     ///
     /// #   Layout Invariance
     ///
-    /// The choice of `T` has no effect on the resulting `header_offset`, `metadata_offset`, nor `allocator_offset`.
+    /// The choice of `T` has no effect on the resulting `metadata_offset`, `header_offset`, nor `allocator_offset`.
     /// Therefore these offsets may be consulted by substituting `()` for `T`.
     ///
-    /// The choice of `A` has no effect on the resulting `header_offset`, nor `metadata_offset`. Therefore these offsets
+    /// The choice of `A` has no effect on the resulting `metadata_offset`, nor `header_offset`. Therefore these offsets
     /// may be consulted by substituting `()` for `A`.
     ///
     /// Combining the above, this means that `ThinLayout::new::<(), H, U, ()>()` will yield compatible header & metadata
@@ -37,16 +37,16 @@ impl ThinLayout {
     {
         //  The compiler will error if this type cannot be represented (too large).
         #[allow(dead_code)]
-        struct Block<T, H, U, A>(T, H, <U as Pointee>::Metadata, Packed<A>)
+        struct Block<T, H, U, A>(T, ((<U as Pointee>::Metadata, H), Packed<A>))
         where
             U: ?Sized;
 
         let data = Layout::new::<T>();
-        let header = Layout::new::<H>();
         let metadata = Layout::new::<<U as Pointee>::Metadata>();
+        let header = Layout::new::<H>();
         let allocator = Layout::new::<Packed<A>>();
 
-        let Ok(this) = Self::compute_layout(data, header, metadata, allocator) else {
+        let Ok(this) = Self::compute_layout(data, metadata, header, allocator) else {
             //  Safety:
             //  -   The compiler did not error on `Block`, therefore the layout will not overflow.
             unsafe { hint::unreachable_unchecked() }
@@ -64,24 +64,16 @@ impl ThinLayout {
         T: ?Sized,
     {
         let data = Layout::for_value::<T>(value);
-        let header = Layout::new::<H>();
         let metadata = Layout::new::<<T as Pointee>::Metadata>();
+        let header = Layout::new::<H>();
         let allocator = Layout::new::<Packed<A>>();
 
-        Self::compute_layout(data, header, metadata, allocator)
+        Self::compute_layout(data, metadata, header, allocator)
     }
 
     /// Returns the layout of the complete block.
     pub const fn block(&self) -> Layout {
         self.block
-    }
-
-    /// Returns the offset between the start of the header field and the start of the data field.
-    ///
-    /// A pointer to the header field can be obtained by removing this offset from the location pointed to by the
-    /// thin pointer.
-    pub const fn header_offset(&self) -> usize {
-        self.header_offset
     }
 
     /// Returns the offset between the start of the pointee metadata field and the start of the data field.
@@ -90,6 +82,14 @@ impl ThinLayout {
     /// the thin pointer.
     pub const fn metadata_offset(&self) -> usize {
         self.metadata_offset
+    }
+
+    /// Returns the offset between the start of the header field and the start of the data field.
+    ///
+    /// A pointer to the header field can be obtained by removing this offset from the location pointed to by the
+    /// thin pointer.
+    pub const fn header_offset(&self) -> usize {
+        self.header_offset
     }
 
     /// Returns the offset between the start of the allocator field and the start of the data field.
@@ -142,11 +142,11 @@ impl ThinLayout {
 impl ThinLayout {
     const fn compute_layout(
         data: Layout,
-        header: Layout,
         metadata: Layout,
+        header: Layout,
         allocator: Layout,
     ) -> Result<Self, LayoutError> {
-        let (hm, hm_offset) = match header.extend(metadata) {
+        let (hm, hm_offset) = match metadata.extend(header) {
             Ok(extended) => extended,
             Err(e) => return Err(e),
         };
@@ -162,15 +162,15 @@ impl ThinLayout {
         };
 
         let block = unaligned_block.pad_to_align();
-        let header_offset = header.size();
-        let metadata_offset = hm_offset + metadata.size();
+        let metadata_offset = metadata.size();
+        let header_offset = hm_offset + header.size();
         let allocator_offset = fh_offset + allocator.size();
         let start_offset = block_offset + (block.size() - unaligned_block.size());
 
         Ok(Self {
             block,
-            header_offset,
             metadata_offset,
+            header_offset,
             allocator_offset,
             start_offset,
         })
@@ -189,8 +189,8 @@ mod tests {
         let layout = ThinLayout::new::<[u32; 4], u8, [u32; 4], Allocator>();
 
         assert_eq!((28, 4), (layout.block().size(), layout.block().align()));
+        assert_eq!(0, layout.metadata_offset());
         assert_eq!(1, layout.header_offset());
-        assert_eq!(1, layout.metadata_offset());
         assert_eq!(9, layout.allocator_offset());
         assert_eq!(12, layout.start_offset());
     }
@@ -200,8 +200,8 @@ mod tests {
         let layout = ThinLayout::new::<[u32; 4], usize, [u32], Allocator>();
 
         assert_eq!((40, 8), (layout.block().size(), layout.block().align()));
-        assert_eq!(8, layout.header_offset());
-        assert_eq!(16, layout.metadata_offset());
+        assert_eq!(8, layout.metadata_offset());
+        assert_eq!(16, layout.header_offset());
         assert_eq!(24, layout.allocator_offset());
         assert_eq!(24, layout.start_offset());
     }

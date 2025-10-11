@@ -28,11 +28,11 @@
 //! but to the `data` portion instead. See this diagram:
 //!
 //! ```txt
-//! +----+-----------+----------+----+-------+------+
-//! | .. | allocator | metadata | .. |header | data |
-//! +----+-----------+----------+----+-------+------+
-//!   ^                           ^          ^
-//!   padding                     padding    thin pointer
+//! +----+-----------+--------+----+---------+------+
+//! | .. | allocator | header | .. |metadata | data |
+//! +----+-----------+--------+----+---------+------+
+//!   ^                         ^            ^
+//!   padding                   padding      thin pointer
 //! ```
 
 //  Use only core, with `alloc` just a feature away.
