@@ -219,17 +219,51 @@ impl<T, H> ThinPtrWith<T, H>
 where
     T: ?Sized,
 {
+    /// Returns a pointer to the start of the memory block.
+    ///
+    /// #   Safety
+    ///
+    /// -   SameLayout: the thin memory block must have been allocated with `layout`.
+    #[inline(always)]
+    pub const unsafe fn as_block(&self, layout: ThinLayout) -> *mut u8 {
+        let offset = layout.start_offset();
+
+        //  Safety:
+        //  -   InBounds: `layout.start_offset()` is within the memory block, as per the Suitable pre-condition, and
+        //      the SameLayout pre-condition.
+        unsafe { self.ptr.sub(offset) }
+    }
+
     /// Returns a pointer to the data portion of `T`.
     #[inline(always)]
     pub const fn as_data(&self) -> *mut u8 {
         self.ptr
     }
 
+    /// Returns a pointer to the metadata.
+    ///
+    /// #   Safety
+    ///
+    /// -   Suitable: the thin memory block the pointer points to SHALL have been constructed with metadata for `T`.
+    #[inline(always)]
+    pub const unsafe fn as_metadata(&self) -> *const <T as Pointee>::Metadata {
+        let layout = Self::header_layout();
+
+        let offset = layout.metadata_offset();
+
+        //  Safety:
+        //  -   InBounds: `layout.metadata_offset()` is within the memory block, as per the Suitable pre-condition.
+        let metadata = unsafe { self.ptr.sub(offset) };
+
+        metadata.cast()
+    }
+
     /// Returns a pointer to the header `H`.
     ///
     /// #   Safety
     ///
-    /// -   Suitable: the thin memory block the pointer points to SHALL have been constructed with a header `H`.
+    /// -   Suitable: the thin memory block the pointer points to SHALL have been constructed with metadata for `T`, and
+    ///     a header `H`.
     #[inline(always)]
     pub const unsafe fn as_header(&self) -> *mut H {
         let layout = Self::header_layout();
@@ -243,22 +277,25 @@ where
         header.cast()
     }
 
-    /// Returns a pointer to the metadata.
+    /// Returns a pointer to the allocator.
+    ///
+    /// The pointer return MAY NOT be suitably aligned for A.
     ///
     /// #   Safety
     ///
-    /// -   Suitable: the thin memory block the pointer points to SHALL have been constructed with a header `H`.
+    /// -   Suitable: the thin memory block the pointer points to SHALL have been constructed with metadata for `T`, a
+    ///     header `H`, and an allocator A.
+    /// -   SameLayout: the thin memory block must have been allocated with `layout`.
     #[inline(always)]
-    pub const unsafe fn as_metadata(&self) -> *const <T as Pointee>::Metadata {
-        let layout = Self::header_layout();
-
-        let offset = layout.metadata_offset();
+    pub const unsafe fn as_allocator<A>(&self, layout: ThinLayout) -> *mut A {
+        let offset = layout.allocator_offset();
 
         //  Safety:
-        //  -   InBounds: `layout.metadata_offset()` is within the memory block, as per the Suitable pre-condition.
-        let metadata = unsafe { self.ptr.sub(offset) };
+        //  -   InBounds: `layout.allocator_offset()` is within the memory block, as per the Suitable pre-condition, and
+        //      the SameLayout pre-condition.
+        let allocator = unsafe { self.ptr.sub(offset) };
 
-        metadata.cast()
+        allocator.cast()
     }
 }
 

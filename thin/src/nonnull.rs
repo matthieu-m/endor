@@ -9,7 +9,7 @@ use core::{
     ptr::{NonNull, Pointee},
 };
 
-use crate::ThinPtrWith;
+use crate::{ThinLayout, ThinPtrWith};
 
 /// The thin equivalent of `NonNull<T>`.
 pub type ThinNonNull<T> = ThinNonNullWith<T, ()>;
@@ -243,6 +243,24 @@ impl<T, H> ThinNonNullWith<T, H>
 where
     T: ?Sized,
 {
+    /// Returns a pointer to the start of the memory block.
+    ///
+    /// #   Safety
+    ///
+    /// -   SameLayout: the thin memory block must have been allocated with `layout`.
+    #[inline(always)]
+    pub const fn as_block(&self, layout: ThinLayout) -> NonNull<u8> {
+        let ptr = self.into_thin();
+
+        //  Safety:
+        //  -   SameLayout: a per pre-condition.
+        let block = unsafe { ptr.as_block(layout) };
+
+        //  Safety:
+        //  -   NonNull: `self.ptr` was not null.
+        unsafe { NonNull::new_unchecked(block) }
+    }
+
     /// Returns a pointer to the data portion of `T`.
     #[inline(always)]
     pub const fn as_data(&self) -> NonNull<u8> {
@@ -255,11 +273,30 @@ where
         unsafe { NonNull::new_unchecked(data) }
     }
 
+    /// Returns a pointer to the metadata.
+    ///
+    /// #   Safety
+    ///
+    /// -   Suitable: the thin memory block the pointer points to SHALL have been constructed with metadata for `T`.
+    #[inline(always)]
+    pub const unsafe fn as_metadata(&self) -> NonNull<<T as Pointee>::Metadata> {
+        let ptr = self.into_thin();
+
+        //  Safety:
+        //  -   Suitable: a per pre-condition.
+        let metadata = unsafe { ptr.as_metadata() as *mut _ };
+
+        //  Safety:
+        //  -   NonNull: `self.ptr` was not null.
+        unsafe { NonNull::new_unchecked(metadata) }
+    }
+
     /// Returns a pointer to the header `H`.
     ///
     /// #   Safety
     ///
-    /// -   Suitable: the thin memory block the pointer points to SHALL have been constructed with a header `H`.
+    /// -   Suitable: the thin memory block the pointer points to SHALL have been constructed with metadata for `T`, and
+    ///     a header `H`.
     #[inline(always)]
     pub const unsafe fn as_header(&self) -> NonNull<H> {
         let ptr = self.into_thin();
@@ -273,22 +310,25 @@ where
         unsafe { NonNull::new_unchecked(header) }
     }
 
-    /// Returns a pointer to the metadata.
+    /// Returns a pointer to the allocator.
+    ///
+    /// The pointer return MAY NOT be suitably aligned for A.
     ///
     /// #   Safety
     ///
-    /// -   Suitable: the thin memory block the pointer points to SHALL have been constructed with a header `H`.
+    /// -   Suitable: the thin memory block the pointer points to SHALL have been constructed with an allocator A.
+    /// -   SameLayout: the thin memory block must have been allocated with `layout`.
     #[inline(always)]
-    pub const unsafe fn as_metadata(&self) -> NonNull<<T as Pointee>::Metadata> {
+    pub const unsafe fn as_allocator<A>(&self, layout: ThinLayout) -> NonNull<A> {
         let ptr = self.into_thin();
 
         //  Safety:
-        //  -   Suitable: a per pre-condition.
-        let metadata = unsafe { ptr.as_metadata() as *mut _ };
+        //  -   Suitable & SameLayout: a per pre-condition.
+        let allocator = unsafe { ptr.as_allocator(layout) };
 
         //  Safety:
         //  -   NonNull: `self.ptr` was not null.
-        unsafe { NonNull::new_unchecked(metadata) }
+        unsafe { NonNull::new_unchecked(allocator) }
     }
 }
 

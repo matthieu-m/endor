@@ -7,6 +7,8 @@ use core::{
     marker::Unsize,
     mem::{self, MaybeUninit},
     ops, panic,
+    pin::Pin,
+    ptr::NonNull,
 };
 
 use alloc::alloc::{AllocError, Allocator, Global};
@@ -38,20 +40,30 @@ where
     ///
     /// #   Safety
     ///
-    /// -   RoundTrip: `ptr` must have been obtained by a call to `Self::into_raw`.
+    /// -   RoundTrip: `ptr` must have been obtained by a call to `Self::into_non_null`.
     #[inline(always)]
-    pub unsafe fn from_raw(ptr: ThinNonNullWith<T, H>) -> Self {
+    pub unsafe fn from_non_null(ptr: ThinNonNullWith<T, H>) -> Self {
         //  Safety:
         //  -   RoundTrip: as per pre-condition.
-        let inner = unsafe { ThinRawWith::from_raw(ptr) };
+        let inner = unsafe { ThinRawWith::from_non_null(ptr) };
 
         Self { inner }
     }
 
     /// Deconstructs the instance, returning a raw pointer instead.
     #[inline(always)]
-    pub fn into_raw(self) -> ThinNonNullWith<T, H> {
-        self.inner.into_raw()
+    pub fn into_non_null(this: Self) -> ThinNonNullWith<T, H> {
+        let inner = Self::into_raw(this);
+
+        inner.into_non_null()
+    }
+
+    /// Converts a `Self` into a `Pin<Self>`.
+    #[inline(always)]
+    pub fn into_pin(this: Self) -> Pin<Self> {
+        //  Safety:
+        //  -   Pinned: single memory allocation, nothing will move.
+        unsafe { Pin::new_unchecked(this) }
     }
 }
 
@@ -59,17 +71,41 @@ impl<T, H, A> ThinBoxWith<T, H, A>
 where
     A: Allocator,
 {
+    /// Consumes the box, deallocating.
+    #[inline]
+    pub fn into_inner(this: Self) -> (T, H, A) {
+        let inner = Self::into_raw(this);
+
+        //  Safety:
+        //  -   `EndOfLife`: `this` will no longer be used as is.
+        unsafe { ThinRawWith::into_inner(inner) }
+    }
+
     /// Consumes the box without consuming its allocation.
     #[inline]
     pub fn take(this: Self) -> (T, H, ThinBoxWith<MaybeUninit<T>, MaybeUninit<H>, A>) {
+        let inner = Self::into_raw(this);
+
         //  Safety:
         //  -   `EndOfLife`: `this` will no longer be used as is.
-        let (value, header, inner) = unsafe { ThinRawWith::take(this.inner) };
-
-        //  Don't drop it!
-        mem::forget(this);
+        let (value, header, inner) = unsafe { ThinRawWith::take(inner) };
 
         (value, header, ThinBoxWith { inner })
+    }
+
+    /// Consumes and leaks the box.
+    ///
+    /// Not only is the allocation leaked, so is the allocator.
+    #[inline]
+    pub fn leak<'a>(this: Self) -> (&'a mut T, &'a mut H)
+    where
+        A: 'a,
+    {
+        let inner = Self::into_raw(this);
+
+        //  Safety:
+        //  -   Convertible: alive & `inner` will never be able to access those values.
+        unsafe { (inner.as_mut(), inner.as_header_mut()) }
     }
 }
 
@@ -84,11 +120,11 @@ where
     /// -   Initialized: as per `MaybeUninit::assume_init`.
     #[inline(always)]
     pub unsafe fn assume_init(this: Self) -> ThinBoxWith<T, H, A> {
+        let inner = Self::into_raw(this);
+
         //  Safety:
         //  -   Initialized: as per pre-condition.
-        let inner = unsafe { ThinRawWith::assume_init(this.inner) };
-
-        mem::forget(this);
+        let inner = unsafe { ThinRawWith::<MaybeUninit<T>, MaybeUninit<H>, A>::assume_init(inner) };
 
         ThinBoxWith { inner }
     }
@@ -96,13 +132,61 @@ where
     /// Initializes the uninitialized parts of `self`.
     #[inline]
     pub fn write(this: Self, value: T, header: H) -> ThinBoxWith<T, H, A> {
+        let inner = Self::into_raw(this);
+
         //  Safety:
         //  -   Mutable: no other instance of the box can be used simultaneously.
-        let inner = unsafe { ThinRawWith::write(this.inner, value, header) };
+        let inner = unsafe { ThinRawWith::write(inner, value, header) };
+
+        ThinBoxWith { inner }
+    }
+
+    /// Recovers the allocator.
+    ///
+    /// It is up to the caller to ensure that `T` and `H` are indeed uninitialized, their destructors WILL NOT be
+    /// called.
+    #[inline]
+    pub fn into_allocator(this: Self) -> A {
+        let inner = Self::into_raw(this);
+
+        //  Safety:
+        //  -   EndOfLife: no other instance exists, and this one instance HAS BEEN forgotten.
+        unsafe { ThinRawWith::into_allocator(inner) }
+    }
+}
+
+impl<T, H, A> ThinBoxWith<[MaybeUninit<T>], MaybeUninit<H>, A>
+where
+    A: Allocator,
+{
+    /// Converts to `ThinBoxWith<[T], H, A>`.
+    ///
+    /// #   Safety
+    ///
+    /// -   Initialized: as per `MaybeUninit::assume_init`.
+    #[inline(always)]
+    pub unsafe fn assume_init(this: Self) -> ThinBoxWith<[T], H, A> {
+        let inner = Self::into_raw(this);
+
+        //  Safety:
+        //  -   Initialized: as per pre-condition.
+        let inner = unsafe { ThinRawWith::<[MaybeUninit<T>], MaybeUninit<H>, A>::assume_init(inner) };
+
+        ThinBoxWith { inner }
+    }
+}
+
+impl<T, H, A> ThinBoxWith<T, H, A>
+where
+    T: ?Sized,
+    A: Allocator,
+{
+    fn into_raw(this: Self) -> ThinRawWith<T, H, A> {
+        let inner = this.inner;
 
         mem::forget(this);
 
-        ThinBoxWith { inner }
+        inner
     }
 }
 
@@ -337,12 +421,6 @@ where
     T: ?Sized,
     A: Allocator,
 {
-    /// Returns a pointer to the inner data.
-    #[inline(always)]
-    pub const fn as_ptr(&self) -> ThinNonNullWith<T, H> {
-        self.inner.as_ptr()
-    }
-
     /// Returns a reference to the data.
     #[inline(always)]
     pub const fn as_ref(&self) -> &T {
@@ -373,6 +451,30 @@ where
         //  Safety:
         //  -   Convertible: alive & guarded exclusive access.
         unsafe { self.inner.as_header_mut() }
+    }
+}
+
+//
+//  Low-level Access
+//
+
+impl<T, H, A> ThinBoxWith<T, H, A>
+where
+    T: ?Sized,
+    A: Allocator,
+{
+    /// Returns a pointer to the inner data.
+    #[inline(always)]
+    pub const fn as_non_null(&self) -> ThinNonNullWith<T, H> {
+        self.inner.as_non_null()
+    }
+
+    /// Returns a pointer to the allocator.
+    ///
+    /// The pointer MAY NOT be suitably aligned for `A`.
+    #[inline(always)]
+    pub const fn as_allocator(this: &Self) -> NonNull<A> {
+        this.inner.as_allocator()
     }
 }
 

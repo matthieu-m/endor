@@ -37,9 +37,9 @@ where
     ///
     /// #   Safety
     ///
-    /// -   RoundTrip: `ptr` must have been obtained by a call to `Self::into_raw`.
+    /// -   RoundTrip: `ptr` must have been obtained by a call to `Self::into_non_null`.
     #[inline(always)]
-    pub(crate) unsafe fn from_raw(ptr: ThinNonNullWith<T, H>) -> Self {
+    pub(crate) unsafe fn from_non_null(ptr: ThinNonNullWith<T, H>) -> Self {
         let _allocator = PhantomInvariant::new();
 
         Self { ptr, _allocator }
@@ -47,7 +47,7 @@ where
 
     /// Deconstructs the instance, returning a raw pointer instead.
     #[inline(always)]
-    pub(crate) fn into_raw(self) -> ThinNonNullWith<T, H> {
+    pub(crate) fn into_non_null(self) -> ThinNonNullWith<T, H> {
         self.ptr
     }
 }
@@ -56,6 +56,28 @@ impl<T, H, A> ThinRawWith<T, H, A>
 where
     A: Allocator,
 {
+    /// Returns the elements, and the allocator.
+    ///
+    /// #   Safety
+    ///
+    /// -   EndOfLife: both this instance and any of its copies SHALL never be dereferenced again until the value &
+    ///     header have been replaced.
+    #[inline]
+    pub(crate) unsafe fn into_inner(this: Self) -> (T, H, A) {
+        //  Safety:
+        //  -   EndOfLife: as pre-condition.
+        let (value, header, uninit) = unsafe { Self::take(this) };
+
+        //  Ensure we really have the right type.
+        let uninit: ThinRawWith<MaybeUninit<T>, MaybeUninit<H>, A> = uninit;
+
+        //  Safety:
+        //  -   EndOfLife: as pre-condition.
+        let allocator = unsafe { ThinRawWith::into_allocator(uninit) };
+
+        (value, header, allocator)
+    }
+
     /// Returns the elements, and an allocation suitable to place them.
     ///
     /// #   Safety
@@ -138,6 +160,54 @@ where
         //  Safety:
         //  -   Initialized: just written.
         unsafe { Self::assume_init(this) }
+    }
+
+    /// Recovers the allocator.
+    ///
+    /// It is up to the caller to ensure that `T` and `H` are indeed uninitialized, their destructors WILL NOT be
+    /// called.
+    ///
+    /// #   Safety
+    ///
+    /// -   EndOfLife: both this instance and any of its copies SHALL never be dereferenced again until the value &
+    ///     header have been replaced.
+    #[inline]
+    pub(crate) unsafe fn into_allocator(this: Self) -> A {
+        let layout = this.layout();
+
+        let ptr = this.as_block();
+        let allocator = this.as_allocator();
+
+        //  Safety:
+        //  -   Suitable: per invariant, if possibly unaligned.
+        //  -   Valid: per EndOfLife pre-condition.
+        let allocator = unsafe { allocator.read_unaligned() };
+
+        //  Safety:
+        //  -   SameAllocator: `ptr` was allocated by `allocator`.
+        //  -   FitLayout: `ptr` was allocated with `layout.block()`.
+        unsafe { allocator.deallocate(ptr, layout.block()) };
+
+        allocator
+    }
+}
+
+impl<T, H, A> ThinRawWith<[MaybeUninit<T>], MaybeUninit<H>, A>
+where
+    A: Allocator,
+{
+    /// Converts to `ThinRawWith<[T], H, A>`.
+    ///
+    /// #   Safety
+    ///
+    /// -   Initialized: as per `MaybeUninit::assume_init`.
+    #[inline(always)]
+    pub(crate) unsafe fn assume_init(this: Self) -> ThinRawWith<[T], H, A> {
+        //  Safety:
+        //  -   Transmutable:
+        //      -   `#[repr(transparent)]` down to `NonNull<u8>`.
+        //      -   `MaybeUninit<T>` is itself `#[repr(transparent)]` with `T`.
+        unsafe { mem::transmute::<Self, _>(this) }
     }
 }
 
@@ -357,32 +427,24 @@ where
         //  -   Suitable: suitably allocated.
         let header = unsafe { self.ptr.as_header() };
 
-        //  Safety:
-        //  -   Convertible: `value` is either a valid value, or is a zero-sized type.
-        let Ok(layout) = ThinLayout::for_value::<_, H, A>(unsafe { value.as_ref() }) else {
-            //  Safety:
-            //  -   This block was allocated, therefore computation succeeded already.
-            unsafe { hint::unreachable_unchecked() }
-        };
+        let layout = self.layout();
 
         let is_zst =
             layout.block().size() == layout.start_offset() && mem::size_of::<H>() == 0 && mem::size_of::<A>() == 0;
 
         let allocator: A = {
-            //  Safety:
-            //  -   InBounds: allocated as per layout.
-            let allocator = unsafe { self.ptr.into_raw().sub(layout.allocator_offset()) };
+            let allocator = self.as_allocator();
 
             //  Safety:
             //  -   Read: either ZST in which case all reads are valid, or otherwise a memory block was allocated and
             //      `allocator` was moved at this offset.
             //  -   Live: as per the EndOfLife pre-condition, `allocator` was never read out of this location before.
-            unsafe { allocator.cast().read_unaligned() }
+            unsafe { allocator.read_unaligned() }
         };
 
         let _guard = DropGuard {
             //  Do not drop a ZST, it is either dangling or const-allocated.
-            ptr: (!is_zst).then_some(self.ptr.into_raw()),
+            ptr: (!is_zst).then_some(self.as_block()),
             layout: layout.block(),
             allocator,
         };
@@ -407,7 +469,7 @@ where
 {
     /// Returns a pointer to the inner data.
     #[inline(always)]
-    pub(crate) const fn as_ptr(&self) -> ThinNonNullWith<T, H> {
+    pub(crate) const fn as_non_null(&self) -> ThinNonNullWith<T, H> {
         self.ptr
     }
 
@@ -461,6 +523,58 @@ where
         //  -   Suitable: as per invariant.
         //  -   Convertible: as per pre-condition.
         unsafe { self.ptr.as_header_mut() }
+    }
+}
+
+//
+//  Low-level Access
+//
+
+impl<T, H, A> ThinRawWith<T, H, A>
+where
+    T: ?Sized,
+    A: Allocator,
+{
+    /// Returns a pointer to the start of the memory block.
+    #[inline(always)]
+    pub const fn as_block(&self) -> NonNull<u8> {
+        let layout = self.layout();
+
+        //  Safety:
+        //  -   Suitable: per invariant.
+        //  -   SameLayout: initially allocated with `layout`.
+        self.ptr.as_block(layout)
+    }
+
+    /// Returns a pointer to the allocator.
+    ///
+    /// The pointer MAY NOT be suitably aligned for `A`.
+    #[inline(always)]
+    pub const fn as_allocator(&self) -> NonNull<A> {
+        let layout = self.layout();
+
+        //  Safety:
+        //  -   Suitable: per invariant.
+        //  -   SameLayout: initially allocated with `layout`.
+        unsafe { self.ptr.as_allocator(layout) }
+    }
+
+    /// Returns the thin layout.
+    #[inline(always)]
+    pub const fn layout(&self) -> ThinLayout {
+        //  Safety:
+        //  -   Metadata & Suitable: per invariant.
+        let value = unsafe { self.ptr.as_ptr() };
+
+        //  Safety:
+        //  -   Convertible: `value` is either a valid value, or is a zero-sized type.
+        let Ok(layout) = ThinLayout::for_value::<_, H, A>(unsafe { value.as_ref() }) else {
+            //  Safety:
+            //  -   This block was allocated, therefore computation succeeded already.
+            unsafe { hint::unreachable_unchecked() }
+        };
+
+        layout
     }
 }
 
