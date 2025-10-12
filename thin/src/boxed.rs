@@ -549,7 +549,7 @@ where
 {
     #[inline(always)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        fmt::Display::fmt(&self.as_ref(), f)
+        fmt::Display::fmt(&Self::as_ref(self), f)
     }
 }
 
@@ -571,7 +571,7 @@ where
 {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
-        self.as_ref().eq(other.as_ref())
+        Self::as_ref(self).eq(Self::as_ref(other))
     }
 }
 
@@ -585,7 +585,7 @@ where
     where
         HS: hash::Hasher,
     {
-        self.as_ref().hash(hasher);
+        Self::as_ref(self).hash(hasher);
     }
 }
 
@@ -600,7 +600,7 @@ where
 {
     #[inline(always)]
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.as_ref().cmp(other.as_ref())
+        Self::as_ref(self).cmp(Self::as_ref(other))
     }
 }
 
@@ -611,7 +611,7 @@ where
 {
     #[inline(always)]
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        self.as_ref().partial_cmp(other.as_ref())
+        Self::as_ref(self).partial_cmp(Self::as_ref(other))
     }
 }
 
