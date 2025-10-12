@@ -1,37 +1,34 @@
-//! Thin pointers equivalent of `Box<T>`.
+//! Thin pointers equivalent of `Rc<T>`, without weak pointers.
 //!
-//! For the layout of these thin pointers, refer to the crate-level documentation.
+//! For the layout of these thin pointers, refer to the crate-level documentation, noting that there is _always_ a
+//! an additional header for the reference count.
 
-use core::{
-    cmp, convert, fmt, hash,
-    marker::Unsize,
-    mem::{self, MaybeUninit},
-    ops, panic,
-    pin::Pin,
-    ptr::NonNull,
-};
+use core::{cell::Cell, cmp, convert, fmt, hash, marker::Unsize, mem::ManuallyDrop, ops, pin::Pin, ptr::NonNull};
 
 use alloc::alloc::{AllocError, Allocator, Global};
 
-use crate::{ThinNonNullWith, ThinRawWith};
+use crate::{ThinNonNullWith, ThinRawRcWith, ThinRefCount, ThinRefCountHeader};
 
-/// The thin equivalent of `Box<T, A = Global>`.
-pub type ThinBox<T, A = Global> = ThinBoxWith<T, (), A>;
+/// The thin equivalent of `Rc<T, A = Global>`.
+pub type ThinRcLite<T, A = Global> = ThinRcLiteWith<T, (), A>;
 
-/// The thin equivalent of `Box<T, A = Global>`, with a header of the user's choice.
-pub struct ThinBoxWith<T, H, A = Global>
+/// The header used by `ThinRcLiteWith`.
+pub type ThinRcLiteHeader<H> = ThinRefCountHeader<H, ThinRcLiteCount>;
+
+/// The thin equivalent of `Rc<T, A = Global>`, with a header of the user's choice.
+pub struct ThinRcLiteWith<T, H, A = Global>
 where
     T: ?Sized,
     A: Allocator,
 {
-    inner: ThinRawWith<T, H, A>,
+    inner: ThinRawRcWith<T, H, ThinRcLiteCount, A>,
 }
 
 //
 //  Conversion
 //
 
-impl<T, H, A> ThinBoxWith<T, H, A>
+impl<T, H, A> ThinRcLiteWith<T, H, A>
 where
     T: ?Sized,
     A: Allocator,
@@ -42,20 +39,18 @@ where
     ///
     /// -   RoundTrip: `ptr` must have been obtained by a call to `Self::into_non_null`.
     #[inline(always)]
-    pub unsafe fn from_non_null(ptr: ThinNonNullWith<T, H>) -> Self {
+    pub unsafe fn from_raw(ptr: ThinNonNullWith<T, ThinRcLiteHeader<H>>) -> Self {
         //  Safety:
         //  -   RoundTrip: as per pre-condition.
-        let inner = unsafe { ThinRawWith::from_non_null(ptr) };
+        let inner = unsafe { ThinRawRcWith::from_non_null(ptr) };
 
         Self { inner }
     }
 
     /// Deconstructs the instance, returning a raw pointer instead.
     #[inline(always)]
-    pub fn into_non_null(this: Self) -> ThinNonNullWith<T, H> {
-        let inner = Self::into_raw(this);
-
-        inner.into_non_null()
+    pub fn into_non_null(this: Self) -> ThinNonNullWith<T, ThinRcLiteHeader<H>> {
+        this.inner.into_non_null()
     }
 
     /// Converts a `Self` into a `Pin<Self>`.
@@ -67,134 +62,11 @@ where
     }
 }
 
-impl<T, H, A> ThinBoxWith<T, H, A>
-where
-    A: Allocator,
-{
-    /// Consumes the box, deallocating.
-    #[inline]
-    pub fn into_inner(this: Self) -> (T, H, A) {
-        let inner = Self::into_raw(this);
-
-        //  Safety:
-        //  -   `EndOfLife`: `this` will no longer be used as is.
-        unsafe { ThinRawWith::into_inner(inner) }
-    }
-
-    /// Consumes the box without consuming its allocation.
-    #[inline]
-    pub fn take(this: Self) -> (T, H, ThinBoxWith<MaybeUninit<T>, MaybeUninit<H>, A>) {
-        let inner = Self::into_raw(this);
-
-        //  Safety:
-        //  -   `EndOfLife`: `this` will no longer be used as is.
-        let (value, header, inner) = unsafe { ThinRawWith::take(inner) };
-
-        (value, header, ThinBoxWith { inner })
-    }
-
-    /// Consumes and leaks the box.
-    ///
-    /// Not only is the allocation leaked, so is the allocator.
-    #[inline]
-    pub fn leak<'a>(this: Self) -> (&'a mut T, &'a mut H)
-    where
-        A: 'a,
-    {
-        let inner = Self::into_raw(this);
-
-        //  Safety:
-        //  -   Convertible: alive & `inner` will never be able to access those values.
-        unsafe { (inner.as_mut(), inner.as_header_mut()) }
-    }
-}
-
-impl<T, H, A> ThinBoxWith<MaybeUninit<T>, MaybeUninit<H>, A>
-where
-    A: Allocator,
-{
-    /// Converts to `ThinBoxWith<T, H, A>`.
-    ///
-    /// #   Safety
-    ///
-    /// -   Initialized: as per `MaybeUninit::assume_init`.
-    #[inline(always)]
-    pub unsafe fn assume_init(this: Self) -> ThinBoxWith<T, H, A> {
-        let inner = Self::into_raw(this);
-
-        //  Safety:
-        //  -   Initialized: as per pre-condition.
-        let inner = unsafe { ThinRawWith::<MaybeUninit<T>, MaybeUninit<H>, A>::assume_init(inner) };
-
-        ThinBoxWith { inner }
-    }
-
-    /// Initializes the uninitialized parts of `self`.
-    #[inline]
-    pub fn write(this: Self, value: T, header: H) -> ThinBoxWith<T, H, A> {
-        let inner = Self::into_raw(this);
-
-        //  Safety:
-        //  -   Mutable: no other instance of the box can be used simultaneously.
-        let inner = unsafe { ThinRawWith::write(inner, value, header) };
-
-        ThinBoxWith { inner }
-    }
-
-    /// Recovers the allocator.
-    ///
-    /// It is up to the caller to ensure that `T` and `H` are indeed uninitialized, their destructors WILL NOT be
-    /// called.
-    #[inline]
-    pub fn into_allocator(this: Self) -> A {
-        let inner = Self::into_raw(this);
-
-        //  Safety:
-        //  -   EndOfLife: no other instance exists, and this one instance HAS BEEN forgotten.
-        unsafe { ThinRawWith::into_allocator(inner) }
-    }
-}
-
-impl<T, H, A> ThinBoxWith<[MaybeUninit<T>], MaybeUninit<H>, A>
-where
-    A: Allocator,
-{
-    /// Converts to `ThinBoxWith<[T], H, A>`.
-    ///
-    /// #   Safety
-    ///
-    /// -   Initialized: as per `MaybeUninit::assume_init`.
-    #[inline(always)]
-    pub unsafe fn assume_init(this: Self) -> ThinBoxWith<[T], H, A> {
-        let inner = Self::into_raw(this);
-
-        //  Safety:
-        //  -   Initialized: as per pre-condition.
-        let inner = unsafe { ThinRawWith::<[MaybeUninit<T>], MaybeUninit<H>, A>::assume_init(inner) };
-
-        ThinBoxWith { inner }
-    }
-}
-
-impl<T, H, A> ThinBoxWith<T, H, A>
-where
-    T: ?Sized,
-    A: Allocator,
-{
-    fn into_raw(this: Self) -> ThinRawWith<T, H, A> {
-        let inner = this.inner;
-
-        mem::forget(this);
-
-        inner
-    }
-}
-
 //
 //  Construction
 //
 
-impl<T> ThinBoxWith<T, (), Global> {
+impl<T> ThinRcLiteWith<T, (), Global> {
     /// Allocates memory on the heap and then places `value` into it.
     ///
     /// #   Panics
@@ -214,7 +86,7 @@ impl<T> ThinBoxWith<T, (), Global> {
     }
 }
 
-impl<U> ThinBoxWith<U, (), Global>
+impl<U> ThinRcLiteWith<U, (), Global>
 where
     U: ?Sized,
 {
@@ -243,7 +115,7 @@ where
     }
 }
 
-impl<T, H> ThinBoxWith<T, H, Global> {
+impl<T, H> ThinRcLiteWith<T, H, Global> {
     /// Allocates memory on the heap and then places `value` and `header` into it.
     ///
     /// #   Panics
@@ -263,7 +135,7 @@ impl<T, H> ThinBoxWith<T, H, Global> {
     }
 }
 
-impl<U, H> ThinBoxWith<U, H, Global>
+impl<U, H> ThinRcLiteWith<U, H, Global>
 where
     U: ?Sized,
 {
@@ -292,7 +164,7 @@ where
     }
 }
 
-impl<T, A> ThinBoxWith<T, (), A>
+impl<T, A> ThinRcLiteWith<T, (), A>
 where
     A: Allocator,
 {
@@ -315,7 +187,7 @@ where
     }
 }
 
-impl<U, A> ThinBoxWith<U, (), A>
+impl<U, A> ThinRcLiteWith<U, (), A>
 where
     U: ?Sized,
     A: Allocator,
@@ -345,7 +217,7 @@ where
     }
 }
 
-impl<T, H, A> ThinBoxWith<T, H, A>
+impl<T, H, A> ThinRcLiteWith<T, H, A>
 where
     A: Allocator,
 {
@@ -363,11 +235,11 @@ where
     ///
     /// Returns an error if the allocation fails. Use `new_in` for a panicking version instead.
     pub fn try_new_with_in(value: T, header: H, allocator: A) -> Result<Self, AllocError> {
-        ThinRawWith::try_new(value, header, allocator).map(|inner| Self { inner })
+        ThinRawRcWith::try_new(value, header, allocator).map(|inner| Self { inner })
     }
 }
 
-impl<U, H, A> ThinBoxWith<U, H, A>
+impl<U, H, A> ThinRcLiteWith<U, H, A>
 where
     U: ?Sized,
     A: Allocator,
@@ -392,23 +264,19 @@ where
     where
         T: Unsize<U>,
     {
-        ThinRawWith::try_new_unsize(value, header, allocator).map(|inner| Self { inner })
+        ThinRawRcWith::try_new_unsize(value, header, allocator).map(|inner| Self { inner })
     }
 }
 
-//
-//  Destruction
-//
-
-impl<T, H, A> Drop for ThinBoxWith<T, H, A>
+impl<T, H, A> Clone for ThinRcLiteWith<T, H, A>
 where
     T: ?Sized,
     A: Allocator,
 {
-    fn drop(&mut self) {
-        //  Safety:
-        //  -   EndOfLife: last use of `self.inner`.
-        unsafe { self.inner.drop() };
+    fn clone(&self) -> Self {
+        let inner = self.inner.clone();
+
+        Self { inner }
     }
 }
 
@@ -416,7 +284,7 @@ where
 //  High-level Access
 //
 
-impl<T, H, A> ThinBoxWith<T, H, A>
+impl<T, H, A> ThinRcLiteWith<T, H, A>
 where
     T: ?Sized,
     A: Allocator,
@@ -424,33 +292,13 @@ where
     /// Returns a reference to the data.
     #[inline(always)]
     pub const fn as_ref(this: &Self) -> &T {
-        //  Safety:
-        //  -   Convertible: alive & guarded shared access.
-        unsafe { this.inner.as_ref() }
-    }
-
-    /// Returns a reference to the data.
-    #[inline(always)]
-    pub const fn as_mut(this: &mut Self) -> &mut T {
-        //  Safety:
-        //  -   Convertible: alive & guarded exclusive access.
-        unsafe { this.inner.as_mut() }
+        this.inner.as_ref()
     }
 
     /// Returns a reference to `H`.
     #[inline(always)]
     pub const fn as_header_ref(this: &Self) -> &H {
-        //  Safety:
-        //  -   Convertible: alive & guarded shared access.
-        unsafe { this.inner.as_header_ref() }
-    }
-
-    /// Returns a mutable reference to `H`.
-    #[inline(always)]
-    pub const fn as_header_mut(this: &mut Self) -> &mut H {
-        //  Safety:
-        //  -   Convertible: alive & guarded exclusive access.
-        unsafe { this.inner.as_header_mut() }
+        this.inner.as_header_ref()
     }
 }
 
@@ -458,15 +306,15 @@ where
 //  Low-level Access
 //
 
-impl<T, H, A> ThinBoxWith<T, H, A>
+impl<T, H, A> ThinRcLiteWith<T, H, A>
 where
     T: ?Sized,
     A: Allocator,
 {
     /// Returns a pointer to the inner data.
     #[inline(always)]
-    pub const fn as_non_null(&self) -> ThinNonNullWith<T, H> {
-        self.inner.as_non_null()
+    pub const fn as_non_null(this: &Self) -> ThinNonNullWith<T, ThinRcLiteHeader<H>> {
+        this.inner.as_non_null()
     }
 
     /// Returns a pointer to the allocator.
@@ -482,7 +330,7 @@ where
 //  Value Access
 //
 
-impl<T, H, A> convert::AsRef<T> for ThinBoxWith<T, H, A>
+impl<T, H, A> convert::AsRef<T> for ThinRcLiteWith<T, H, A>
 where
     T: ?Sized,
     A: Allocator,
@@ -492,17 +340,7 @@ where
     }
 }
 
-impl<T, H, A> convert::AsMut<T> for ThinBoxWith<T, H, A>
-where
-    T: ?Sized,
-    A: Allocator,
-{
-    fn as_mut(&mut self) -> &mut T {
-        Self::as_mut(self)
-    }
-}
-
-impl<T, H, A> ops::Deref for ThinBoxWith<T, H, A>
+impl<T, H, A> ops::Deref for ThinRcLiteWith<T, H, A>
 where
     T: ?Sized,
     A: Allocator,
@@ -514,42 +352,32 @@ where
     }
 }
 
-impl<T, H, A> ops::DerefMut for ThinBoxWith<T, H, A>
-where
-    T: ?Sized,
-    A: Allocator,
-{
-    fn deref_mut(&mut self) -> &mut T {
-        Self::as_mut(self)
-    }
-}
-
 //
 //  Formatting
 //
 
-impl<T, H, A> fmt::Debug for ThinBoxWith<T, H, A>
+impl<T, H, A> fmt::Debug for ThinRcLiteWith<T, H, A>
 where
     T: ?Sized + fmt::Debug,
     H: fmt::Debug,
     A: Allocator,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        f.debug_struct("ThinBoxWith")
+        f.debug_struct("ThinRcLiteWith")
             .field("header", Self::as_header_ref(self))
             .field("value", &Self::as_ref(self))
             .finish()
     }
 }
 
-impl<T, H, A> fmt::Display for ThinBoxWith<T, H, A>
+impl<T, H, A> fmt::Display for ThinRcLiteWith<T, H, A>
 where
     T: ?Sized + fmt::Display,
     A: Allocator,
 {
     #[inline(always)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        fmt::Display::fmt(&Self::as_ref(self), f)
+        fmt::Display::fmt(&self.as_ref(), f)
     }
 }
 
@@ -557,14 +385,14 @@ where
 //  Identity
 //
 
-impl<T, H, A> Eq for ThinBoxWith<T, H, A>
+impl<T, H, A> Eq for ThinRcLiteWith<T, H, A>
 where
     T: ?Sized + Eq,
     A: Allocator,
 {
 }
 
-impl<T, H, A> PartialEq for ThinBoxWith<T, H, A>
+impl<T, H, A> PartialEq for ThinRcLiteWith<T, H, A>
 where
     T: ?Sized + PartialEq,
     A: Allocator,
@@ -575,7 +403,7 @@ where
     }
 }
 
-impl<T, H, A> hash::Hash for ThinBoxWith<T, H, A>
+impl<T, H, A> hash::Hash for ThinRcLiteWith<T, H, A>
 where
     T: ?Sized + hash::Hash,
     A: Allocator,
@@ -593,7 +421,7 @@ where
 //  Ordering
 //
 
-impl<T, H, A> Ord for ThinBoxWith<T, H, A>
+impl<T, H, A> Ord for ThinRcLiteWith<T, H, A>
 where
     T: ?Sized + Ord,
     A: Allocator,
@@ -604,7 +432,7 @@ where
     }
 }
 
-impl<T, H, A> PartialOrd for ThinBoxWith<T, H, A>
+impl<T, H, A> PartialOrd for ThinRcLiteWith<T, H, A>
 where
     T: ?Sized + PartialOrd,
     A: Allocator,
@@ -620,162 +448,220 @@ where
 //
 
 //  Safety: as Box.
-impl<T, H, A> Unpin for ThinBoxWith<T, H, A>
+impl<T, H, A> Unpin for ThinRcLiteWith<T, H, A>
 where
     T: ?Sized,
     A: Allocator,
 {
 }
 
-//  Safety: as Box.
-impl<T, H, A> panic::RefUnwindSafe for ThinBoxWith<T, H, A>
-where
-    T: ?Sized + panic::RefUnwindSafe,
-    H: panic::RefUnwindSafe,
-    A: Allocator + panic::RefUnwindSafe,
-{
+//
+//  Reference count.
+//
+
+/// Both a strong and a weak reference counts.
+#[derive(Debug)]
+pub struct ThinRcLiteCount {
+    strong: Cell<u64>,
 }
 
-//  Safety: as Box.
-impl<T, H, A> panic::UnwindSafe for ThinBoxWith<T, H, A>
-where
-    T: ?Sized + panic::UnwindSafe,
-    H: panic::UnwindSafe,
-    A: Allocator + panic::UnwindSafe,
-{
+impl ThinRcLiteCount {
+    //  Safety:
+    //  -   Accounting: should only be invoked when `self.strong` reaches 0.
+    #[inline(never)]
+    unsafe fn drop<D, DA>(&self, drop: D, deallocate: DA)
+    where
+        D: FnOnce(),
+        DA: FnOnce(),
+    {
+        struct DropGuard<DA>(ManuallyDrop<DA>)
+        where
+            DA: FnOnce();
+
+        impl<DA> Drop for DropGuard<DA>
+        where
+            DA: FnOnce(),
+        {
+            fn drop(&mut self) {
+                //  Safety:
+                //  -   EndOfLife: last use.
+                let deallocate = unsafe { ManuallyDrop::take(&mut self.0) };
+
+                deallocate();
+            }
+        }
+
+        let _guard = DropGuard(ManuallyDrop::new(deallocate));
+
+        drop();
+    }
 }
 
-//  Safety: as Box.
-unsafe impl<T, H, A> Send for ThinBoxWith<T, H, A>
-where
-    T: ?Sized + Send,
-    H: Send,
-    A: Allocator + Send,
-{
-}
+//  Safety:
+//  -   Accounting: properly counted.
+unsafe impl ThinRefCount for ThinRcLiteCount {
+    #[inline(always)]
+    fn new() -> Self {
+        let strong = Cell::new(1);
 
-//  Safety: as Box.
-unsafe impl<T, H, A> Sync for ThinBoxWith<T, H, A>
-where
-    T: ?Sized + Sync,
-    H: Sync,
-    A: Allocator + Sync,
-{
+        Self { strong }
+    }
+
+    #[inline(always)]
+    fn strong_count(&self) -> u64 {
+        self.strong.get()
+    }
+
+    #[inline(always)]
+    unsafe fn increment_strong(&self) {
+        self.strong.update(|c| c + 1);
+    }
+
+    #[inline]
+    unsafe fn decrement_strong<D, DA>(&self, drop: D, deallocate: DA)
+    where
+        D: FnOnce(),
+        DA: FnOnce(),
+    {
+        let strong = self.strong.get() - 1;
+
+        if strong > 0 {
+            self.strong.set(strong);
+            return;
+        }
+
+        //  Safety:
+        //  -   Accounting: strong count reached 0.
+        unsafe { self.drop(drop, deallocate) };
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use core::fmt::Debug;
+    use core::{cell::RefCell, fmt::Debug};
 
     use super::*;
 
     #[test]
     fn decons_vanilla() {
-        let _ = ThinBox::new(value());
+        let _ = ThinRcLite::new(value());
     }
 
     #[test]
     fn decons_with_header() {
-        let _ = ThinBoxWith::new_with(value(), header());
+        let _ = ThinRcLiteWith::new_with(value(), header());
     }
 
     #[test]
     fn decons_unsized() {
-        let _: ThinBox<dyn Debug> = ThinBox::new_unsize(value());
+        let _: ThinRcLite<dyn Debug> = ThinRcLite::new_unsize(value());
     }
 
     #[test]
     fn decons_unsized_with_header() {
-        let _: ThinBoxWith<dyn Debug, _> = ThinBoxWith::new_unsize_with(value(), header());
+        let _: ThinRcLiteWith<dyn Debug, _> = ThinRcLiteWith::new_unsize_with(value(), header());
     }
 
     #[test]
     fn decons_zst() {
-        let _ = ThinBox::new(());
+        let _ = ThinRcLite::new(());
     }
 
     #[test]
     fn decons_zst_with_header() {
-        let _ = ThinBoxWith::new_with((), header());
+        let _ = ThinRcLiteWith::new_with((), header());
     }
 
     #[test]
     fn decons_unsized_zst() {
-        let _: ThinBox<dyn Debug> = ThinBox::new_unsize(());
+        let _: ThinRcLite<dyn Debug> = ThinRcLite::new_unsize(());
     }
 
     #[test]
     fn decons_unsized_zst_with_header() {
-        let _: ThinBoxWith<dyn Debug, _> = ThinBoxWith::new_unsize_with((), header());
+        let _: ThinRcLiteWith<dyn Debug, _> = ThinRcLiteWith::new_unsize_with((), header());
     }
 
     #[test]
     fn deref_vanilla() {
-        let mut thin = ThinBox::new(value());
+        let thin = ThinRcLite::new(value());
 
-        assert_value_mut_str(&mut thin);
-        assert_header_mut_zst(&mut thin);
+        assert_value_mut_str(&thin);
+        assert_header_zst(&thin);
     }
 
     #[test]
     fn deref_with_header() {
-        let mut thin = ThinBoxWith::new_with(value(), header());
+        let thin = ThinRcLiteWith::new_with(value(), header());
 
-        assert_value_mut_str(&mut thin);
-        assert_header_mut_boxed(&mut thin, 33);
-    }
-
-    #[test]
-    fn deref_unsized() {
-        let mut thin: ThinBox<dyn AsMut<str>> = ThinBox::new_unsize(value());
-
-        assert_value_mut_str(&mut thin);
-        assert_header_mut_zst(&mut thin);
-    }
-
-    #[test]
-    fn deref_unsized_with_header() {
-        let mut thin: ThinBoxWith<dyn AsMut<str>, _> = ThinBoxWith::new_unsize_with(value(), header());
-
-        assert_value_mut_str(&mut thin);
-        assert_header_mut_boxed(&mut thin, 33);
+        assert_value_mut_str(&thin);
+        assert_header_mut_boxed(&thin, 33);
     }
 
     #[test]
     fn deref_zst() {
-        let mut thin = ThinBox::new(());
+        let thin = ThinRcLite::new(());
 
-        assert_value_mut_zst(&mut thin);
-        assert_header_mut_zst(&mut thin);
+        assert_value_zst(&thin);
+        assert_header_zst(&thin);
     }
 
     #[test]
     fn deref_zst_with_header() {
-        let mut thin = ThinBoxWith::new_with((), header());
+        let thin = ThinRcLiteWith::new_with((), header());
 
-        assert_value_mut_zst(&mut thin);
-        assert_header_mut_boxed(&mut thin, 33);
+        assert_value_zst(&thin);
+        assert_header_mut_boxed(&thin, 33);
     }
 
     #[test]
-    fn deref_unsized_zst() {
-        let mut thin: ThinBox<dyn Debug> = ThinBox::new_unsize(());
+    fn clone_vanilla() {
+        let thin = ThinRcLite::new(value());
+        let clone = ThinRcLite::clone(&thin);
 
-        assert_header_mut_zst(&mut thin);
+        {
+            let mut t = thin.borrow_mut();
+            let s: &mut str = t.as_mut();
+
+            s.make_ascii_lowercase();
+        }
+
+        {
+            let t = clone.borrow();
+            let s: &str = t.as_ref();
+
+            assert_eq!("hello, world!", s);
+        }
     }
 
     #[test]
-    fn deref_unsized_zst_with_header() {
-        let mut thin: ThinBoxWith<dyn Debug, _> = ThinBoxWith::new_unsize_with((), header());
+    fn clone_with_header() {
+        const HEADER: u32 = 33;
 
-        assert_header_mut_boxed(&mut thin, 33);
+        let thin = ThinRcLiteWith::new_with(value(), header());
+        let clone = ThinRcLiteWith::clone(&thin);
+
+        {
+            let header = ThinRcLiteWith::as_header_ref(&thin);
+            let mut header = header.borrow_mut();
+
+            **header = HEADER;
+        }
+
+        {
+            let header = ThinRcLiteWith::as_header_ref(&clone);
+            let header = header.borrow();
+
+            assert_eq!(HEADER, **header);
+        }
     }
 
-    fn assert_value_mut_str<T, H>(thin: &mut ThinBoxWith<T, H>)
+    fn assert_value_mut_str<T, H>(thin: &ThinRcLiteWith<RefCell<T>, H>)
     where
         T: ?Sized + AsMut<str>,
     {
-        let t: &mut T = &mut *thin;
+        let t: &RefCell<T> = thin;
+        let mut t = t.borrow_mut();
         let s: &mut str = t.as_mut();
 
         s.make_ascii_lowercase();
@@ -783,31 +669,28 @@ mod tests {
         assert_eq!("hello, world!", s);
     }
 
-    fn assert_value_mut_zst<H>(thin: &mut ThinBoxWith<(), H>) {
-        **thin = ();
-
-        assert_eq!((), **thin);
-    }
-
-    fn assert_header_mut_boxed<T, H>(thin: &mut ThinBoxWith<T, Box<H>>, new_header: H)
+    fn assert_header_mut_boxed<T, H>(thin: &ThinRcLiteWith<T, RefCell<Box<H>>>, new_header: H)
     where
         T: ?Sized,
         H: Copy + Debug + Eq,
     {
-        let header = ThinBoxWith::as_header_mut(thin);
+        let header = ThinRcLiteWith::as_header_ref(thin);
+        let mut header = header.borrow_mut();
 
         **header = new_header;
 
         assert_eq!(new_header, **header);
     }
 
-    fn assert_header_mut_zst<T>(thin: &mut ThinBoxWith<T, ()>)
+    fn assert_value_zst<H>(thin: &ThinRcLiteWith<(), H>) {
+        assert_eq!((), **thin);
+    }
+
+    fn assert_header_zst<T>(thin: &ThinRcLiteWith<T, ()>)
     where
         T: ?Sized,
     {
-        let header = ThinBoxWith::as_header_mut(thin);
-
-        *header = ();
+        let header = ThinRcLiteWith::as_header_ref(thin);
 
         assert_eq!((), *header);
     }
@@ -816,14 +699,14 @@ mod tests {
     //
     //  Using a String is the cheapest way to ensure that the destructor is properly called: Miri will error out with
     //  a memory leak if it is not.
-    fn value() -> String {
-        String::from("Hello, World!")
+    fn value() -> RefCell<String> {
+        RefCell::new(String::from("Hello, World!"))
     }
 
     //  Why a Box.
     //
     //  Same reason as the String, just a different type.
-    fn header() -> Box<u32> {
-        Box::new(42)
+    fn header() -> RefCell<Box<u32>> {
+        RefCell::new(Box::new(42))
     }
 } // mod tests

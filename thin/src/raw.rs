@@ -592,8 +592,48 @@ where
     ///
     /// #   Safety
     ///
+    /// -   Droppable: the header and value should be droppable.
     /// -   EndOfLife: both this instance and any of its copies SHALL never be used again after a call to this function.
     pub(crate) unsafe fn drop(&mut self) {
+        //  Safety:
+        //  -   EndOfLife: as per pre-condition.
+        let _guard = unsafe { self.drop_guard() };
+
+        //  Safety:
+        //  -   Droppable: as per Droppable pre-condition.
+        unsafe { self.drop_in_place() }
+    }
+
+    /// Drop the value & header in place.
+    ///
+    /// The allocation remains valid, and may be reused.
+    ///
+    /// #   Safety:
+    ///
+    /// -   Droppable: the header and value should be droppable.
+    pub(crate) unsafe fn drop_in_place(&mut self) {
+        //  Safety:
+        //  -   Metadata & Suitable: suitably allocated.
+        let value = unsafe { self.ptr.as_ptr() };
+
+        //  Safety:
+        //  -   Suitable: suitably allocated.
+        let header = unsafe { self.ptr.as_header() };
+
+        //  Safety:
+        //  -   Valid: `header` and `value` are valid to drop as per EndOfLife pre-condition.
+        unsafe {
+            header.drop_in_place();
+            value.drop_in_place();
+        }
+    }
+
+    /// Deallocates the memory.
+    ///
+    /// #   Safety
+    ///
+    /// -   EndOfLife: the memory allocation is dropped when the guard is, with all the consequences one should expect.
+    pub(crate) unsafe fn drop_guard(&mut self) -> impl Drop + use<T, H, A> {
         //  Ensure deallocation even if the value or header panic during the drop.
         struct DropGuard<A>
         where
@@ -618,14 +658,6 @@ where
             }
         }
 
-        //  Safety:
-        //  -   Metadata & Suitable: suitably allocated.
-        let value = unsafe { self.ptr.as_ptr() };
-
-        //  Safety:
-        //  -   Suitable: suitably allocated.
-        let header = unsafe { self.ptr.as_header() };
-
         let layout = self.layout();
 
         let is_zst =
@@ -641,18 +673,11 @@ where
             unsafe { allocator.read_unaligned() }
         };
 
-        let _guard = DropGuard {
+        DropGuard {
             //  Do not drop a ZST, it is either dangling or const-allocated.
             ptr: (!is_zst).then_some(self.as_block()),
             layout: layout.block(),
             allocator,
-        };
-
-        //  Safety:
-        //  -   Valid: `header` and `value` are valid to drop as per EndOfLife pre-condition.
-        unsafe {
-            header.drop_in_place();
-            value.drop_in_place();
         }
     }
 }
