@@ -70,10 +70,16 @@ pub use ptr::{ThinPtr, ThinPtrWith};
 mod boxed;
 
 #[cfg(feature = "alloc")]
+mod rc;
+
+#[cfg(feature = "alloc")]
 mod raw;
 
 #[cfg(feature = "alloc")]
 pub use boxed::{ThinBox, ThinBoxWith};
+
+#[cfg(feature = "alloc")]
+pub use rc::{RefCount, StrongOnly, ThinRc, ThinRcFlex, ThinRcLite, ThinRcLiteWith, ThinRcWith, WithWeak};
 
 #[cfg(feature = "alloc")]
 pub(crate) use raw::ThinRawWith;
