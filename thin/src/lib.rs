@@ -67,6 +67,12 @@ pub use nonnull::{ThinNonNull, ThinNonNullWith};
 pub use ptr::{ThinPtr, ThinPtrWith};
 
 #[cfg(feature = "alloc")]
+mod arc;
+
+#[cfg(feature = "alloc")]
+mod arc_lite;
+
+#[cfg(feature = "alloc")]
 mod boxed;
 
 #[cfg(feature = "alloc")]
@@ -80,6 +86,12 @@ mod raw;
 
 #[cfg(feature = "alloc")]
 mod raw_rc;
+
+#[cfg(feature = "alloc")]
+pub use arc::{ThinArc, ThinArcCount, ThinArcHeader, ThinArcWith, ThinAwc, ThinAwcWith};
+
+#[cfg(feature = "alloc")]
+pub use arc_lite::{ThinArcLite, ThinArcLiteCount, ThinArcLiteHeader, ThinArcLiteWith};
 
 #[cfg(feature = "alloc")]
 pub use boxed::{ThinBox, ThinBoxWith};
